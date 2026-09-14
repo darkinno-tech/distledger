@@ -38,20 +38,23 @@ Code of conduct: **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)**
 | Attribution binding (first-wins, expiry, poaching protection, no retroactive capture) | ✅ |
 | Multi-level accrual (per SKU, idempotency keys, typed reasons for skipped levels) | ✅ |
 | Freeze snapshot + `Maintain` settlement (state machine + optimistic locking) | ✅ |
-| `SelfCheck` invariants I1 / I2 / I3 | ✅ |
+| `SelfCheck` invariants I1 / I2 / I3 / I4 | ✅ |
 | In-memory store (transactional rollback, keyset pagination, due index) | ✅ |
 | Refund reversal (full order / per item / partial, accumulated in instalments) | ✅ |
 | Risk control: freeze, unfreeze, void | ✅ |
 | **Pluggable SQL store: one core, MySQL / PostgreSQL / SQLite dialects** | ✅ |
 | **Set-based reconciliation, so `SelfCheck` does not need to read every ledger row** | ✅ |
-| Withdrawals and payout channels (including the debt policy for clawing back money already paid out) | ⏳ |
+| Withdrawals: request → review → payout, with the money reserved at application | ✅ |
+| `PayoutChannel` abstraction, with a manual channel and a mock one for tests | ✅ |
+| Debt policy for clawing back money that has already been paid out | ✅ |
 
 **Everything above except withdrawals is usable today**, including multi-instance production
 deployments on MySQL, PostgreSQL or SQLite. `v0.1.0` is the first tagged release.
 
-**Not yet built:** withdrawals and payout channels. Until they exist, money that
-`Maintain` has settled stays in the `available` bucket — the library will not tell you it
-has been paid out, because it cannot know.
+**Not yet built:** nothing in the table above. What is genuinely absent is narrower and
+listed where it belongs: asynchronous payout channels whose outcome is unknown at the time
+of the call (see ADR-043), and withholding tax, which the schema reserves a column for but
+no code writes.
 
 ---
 
@@ -145,13 +148,20 @@ The driver import stays in your module. This is why the library's `go.mod` has a
 go get github.com/darkinno-tech/distledger
 ```
 
-Or run the example straight from the repository — no database, no configuration:
+Or run an example straight from the repository — no database, no configuration:
 
 ```bash
 git clone https://github.com/darkinno-tech/distledger.git
-cd distledger/examples/01-quickstart
+cd distledger/examples/01-quickstart   # commission and settlement
+go run .
+cd ../04-withdraw                      # the payout path and the debt policy
 go run .
 ```
+
+`01-quickstart` is the smallest useful program. `04-withdraw` walks request → review →
+payout, then shows what happens when an order is refunded **after** the money has left —
+with the debt policy off and on, because the default is a refusal and that is worth seeing
+before it happens in production.
 
 Output (abridged):
 
@@ -166,6 +176,7 @@ Output (abridged):
    [PASS] I1: account balance equals sum of ledger deltas (2 checked)
    [PASS] I2: commission ledger linkage and allocation cap (2 checked)
    [PASS] I3: reversal accumulator, state and account totals reconcile (2 checked)
+   [PASS] I4: withdrawal state, reservation and ledger agree (2 checked)
 ```
 
 The smallest useful program:
@@ -243,7 +254,10 @@ func main() {
 | `OnOrderRefunded` | Order refunded → claws back each level according to the **cumulative** refunded amount. **Idempotent; requires your refund identifier.** |
 | `Maintain(ctx)` | Advances everything driven by time. Put it on your scheduler. |
 
-Risk control adds `FreezeCommission` / `UnfreezeCommission` / `VoidCommission`, and `SelfCheck` reports the health of the books.
+Risk control adds `FreezeCommission` / `UnfreezeCommission` / `VoidCommission`.
+Withdrawals add `RequestWithdraw` → `ApproveWithdraw` / `RejectWithdraw` → `PayWithdraw` (through a
+`PayoutChannel`) or `MarkWithdrawPaid` (an operator recording a transfer they made). `SelfCheck`
+reports the health of the books.
 
 ---
 
@@ -252,6 +266,7 @@ Risk control adds `FreezeCommission` / `UnfreezeCommission` / `VoidCommission`, 
 ```
 □ go get github.com/darkinno-tech/distledger
 □ go run ./examples/01-quickstart          → see commission numbers in 30 seconds
+□ go run ./examples/04-withdraw            → see the payout path and the debt policy
 □ set RateBP explicitly in Rules           → the default rate is zero, deliberately (ADR-010)
 □ call OnOrderPaid() after a successful payment   → commission appears as "frozen"
 □ call OnOrderReceived() when the buyer confirms  → available_at is written
@@ -296,7 +311,7 @@ See [PRD.md §6](PRD.md) for the field-level design.
 
 ---
 
-## Three invariants
+## Four invariants
 
 These are the entire reason the library exists, and the things `SelfCheck` should be run against daily:
 
@@ -305,6 +320,7 @@ These are the entire reason the library exists, and the things `SelfCheck` shoul
 | **I1** | An account's balance equals the sum of the ledger deltas for that account; the last entry's post-balance agrees with the account; no bucket is negative | `SelfCheck` re-sums the ledger and compares, bucket by bucket |
 | **I2** | Every commission has a matching ledger entry (referential integrity in both directions), and each accrual item allocates no more than its cap | `SelfCheck` enumerates both ways and verifies the cap |
 | **I3** | The reversal accumulator equals the sum of its detail records, and the account's gross and reversed totals equal the agent's commission roll-up | `SelfCheck` reconciles three directions — this is where refund bugs hide |
+| **I4** | A withdrawal's state agrees with the reserved bucket and with its own ledger entries: a paid withdrawal has a payout entry, a rejected one a refund entry, and the reserved bucket holds exactly the outstanding withdrawals | `SelfCheck` compares the bucket against the sum of reservations. This is the check the state machine cannot make — a half-applied payout is a *legal* transition with the money missing |
 
 > The bucket set is defined in exactly one place (`Bucket`), and the negative-balance guard, I1 and ledger construction all walk it.
 > A reflection test forces every new `Money` field on `Account` to be classified as either a bucket or an explicitly exempt total with a named covering invariant,

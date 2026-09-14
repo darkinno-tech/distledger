@@ -26,19 +26,22 @@
 | 归因绑定（首次优先、有效期、防抢客、防事后追认） | ✅ |
 | 多级分佣（含按 SKU 分佣、幂等键、可解释的跳过原因） | ✅ |
 | 冻结期快照 + `Maintain` 结算（状态机 + 乐观锁） | ✅ |
-| `SelfCheck` 不变量 I1 / I2 / I3 | ✅ |
+| `SelfCheck` 不变量 I1 / I2 / I3 / I4 | ✅ |
 | 内存 Store（事务回滚、键集分页、到期索引） | ✅ |
 | 退款冲正（整单全额 / 按明细 / 整单部分，逐批累加） | ✅ |
 | 风控冻结 / 解冻 / 没收（`Freeze` / `Unfreeze` / `Void`） | ✅ |
 | **可插拔 SQL Store：一套内核，MySQL / PostgreSQL / SQLite 方言** | ✅ |
 | **集合式对账：`SelfCheck` 不必再逐行读完整本流水** | ✅ |
-| 提现链路与打款通道（含「已出账后追回」的欠款策略） | ⏳ |
+| 提现链路：申请 → 审核 → 打款，钱在**申请时**即被冻结 | ✅ |
+| `PayoutChannel` 抽象，附人工通道与测试用 mock 通道 | ✅ |
+| 「已出账后追回」的欠款策略 | ✅ |
 
 **除提现外均已可用**，包括 MySQL / PostgreSQL / SQLite 上的生产多实例部署。
 `v0.1.0` 是首个打 tag 的版本。
 
-**尚未实现**：提现与打款通道。在此落地之前，`Maintain` 结算后的钱停留在 `available` 桶里——
-库不会声称它已出账，因为它无从得知。
+**上表中已无未实现项。** 真正缺的东西更窄，并写在该写的地方：
+结果在调用时未知的**异步打款通道**（见 ADR-043），以及代扣税——
+schema 为它留了一列，但没有任何代码写它。
 
 ---
 
@@ -96,6 +99,7 @@ go run .
    [PASS] I1: account balance equals sum of ledger deltas (2 checked)
    [PASS] I2: commission ledger linkage and allocation cap (2 checked)
    [PASS] I3: reversal accumulator, state and account totals reconcile (2 checked)
+   [PASS] I4: withdrawal state, reservation and ledger agree (2 checked)
 ```
 
 最小可用代码：
@@ -179,7 +183,8 @@ func main() {
 
 ```
 □ go get github.com/darkinno-tech/distledger
-□ go run ./examples/01-quickstart          → 30 秒看到佣金数字
+□ go run ./examples/01-quickstart
+□ go run ./examples/04-withdraw          → 走一遍出金链路与欠款策略
 □ Rules 里显式配置 RateBP                  → 默认费率是 0（刻意，见 ADR-010）
 □ 订单支付成功后调 OnOrderPaid()            → 佣金出现在「待结算」
 □ 收货后调 OnOrderReceived()                → available_at 已写入
@@ -217,13 +222,13 @@ func main() {
 | `dist_account` | 账户（待结算 / 可提现 / 提现中 / 已提现 / 累计） |
 | `dist_ledger` | 资金流水，**复式只追加** |
 | `dist_refund` | 退款凭证：每批次 × 每明细一行，含该明细的**累计退款额** |
-| `dist_withdraw` | ⏳ 尚未实现（提现） |
+| `dist_withdraw` | 提现单：金额、手续费、实付、通道、脱敏账户、状态、流水号 |
 
 详见 [PRD.md §6](PRD.md#6-领域模型)。
 
 ---
 
-## 三条不变量
+## 四条不变量
 
 这是本库存在的全部意义，也是 `SelfCheck` 每天该跑的东西：
 
