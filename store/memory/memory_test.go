@@ -16,7 +16,7 @@ import (
 // Why the index itself has to be checked instead of only the behaviour: the
 // read path performs a freshness check and silently skips stale index
 // entries. That protects correctness, but it also means index misalignment
-// never shows up as a wrong result -- only as something that keeps getting
+// never shows up as a wrong result — only as something that keeps getting
 // slower. Get the rollback wrong and the problem surfaces months later as a
 // performance incident, when it is nearly impossible to attribute.
 
