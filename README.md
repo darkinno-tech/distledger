@@ -4,14 +4,33 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/go-1.22%2B-blue.svg)](https://go.dev/)
-[![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#设计原则)
+[![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#设计铁律)
 
 `distledger` 只解决三件事：**关系链**、**佣金账**、**资金流水**。
 规则（几级、多少比例、要不要门槛）全部外置为可插拔策略。
 
 **它不是一个分销系统**，而是你自建分销系统时那块最容易写错、又最不该重写的底座。
 
-> 📄 完整需求与设计见 **[PRD.md](PRD.md)** ｜ 关键决策记录见 **[docs/design-decisions.md](docs/design-decisions.md)**
+> 📄 完整需求与设计见 **[PRD.md](PRD.md)** ｜ 关键决策与取舍见 **[docs/design-decisions.md](docs/design-decisions.md)**
+
+---
+
+## 当前实现状态
+
+| 能力 | 状态 |
+|---|---|
+| 金额/费率安全运算（整数、防溢出、显式舍入、配额封顶） | ✅ v0.1 |
+| 关系链（父子、深度上限、环检测、上级不可悄悄变更） | ✅ v0.1 |
+| 归因绑定（首次优先、有效期、防抢客、防事后追认） | ✅ v0.1 |
+| 多级分佣（含按 SKU 分佣、幂等键、可解释的跳过原因） | ✅ v0.1 |
+| 冻结期快照 + `Maintain` 结算（状态机 + 乐观锁） | ✅ v0.1 |
+| `SelfCheck` 不变量自检（I1 余额守恒 / I2 配额与引用完整性） | ✅ v0.1 |
+| 内存 Store（事务回滚、键集分页、到期索引） | ✅ v0.1 |
+| 退款冲正（含部分退、已提现追回） | ⏳ v0.3 |
+| MySQL Store | ⏳ v0.4 |
+| 提现链路与打款通道 | ⏳ v0.5 |
+
+**v0.1 已可直接用于单进程部署与测试环境**；生产多实例部署请等 v0.4 的 MySQL Store。
 
 ---
 
@@ -29,16 +48,17 @@
 
 ---
 
-## 设计原则
+## 设计铁律
 
 | 原则 | 含义 |
 |---|---|
 | **切分线** | 能改变"钱**流向**"的进内核；只改变"钱**数值**"的做规则。规则层永远不许改状态 |
 | **默认不发钱** | 默认费率 0、默认 2 级、默认人工打款。宁可配置麻烦，不可默认错发 |
 | **整数金额** | 一律 `int64` 分 + 万分比 `int`，全程禁止浮点 |
-| **账本不可变** | 明细与流水只追加；冲正靠新增负记录 |
+| **账本不可变** | 财务字段与流水只追加；冲正靠新增负记录。这条契约由 Store 端口的形状保证，不靠代码评审 |
+| **失败安全** | 非法状态迁移返回错误而非猜测；不变量不成立时宁可让心跳失败并告警 |
 | **零魔法** | 无 codegen、无反射注册、无全局单例 |
-| **零强依赖** | 核心包不引入任何第三方库 |
+| **零强依赖** | `go.mod` 的 `require` 为空 |
 
 ---
 
@@ -50,6 +70,22 @@ cd distledger/examples/01-quickstart
 go run .
 ```
 
+输出（节选）：
+
+```
+③ 归因成功=true，产生 2 笔佣金
+   第 1 级  分销员=1002  基数=199.00  费率=5%  佣金=9.95
+   第 2 级  分销员=1001  基数=199.00  费率=2%  佣金=3.98
+   重复投递：重放=true，新增佣金=0 笔（幂等生效）
+④ 收货后 用户 1001：待结算=3.98 可提现=0.00 累计=3.98
+⑤ 推进 8 天后结算 2 笔，合计 13.93
+⑦ 自检：存储=memory 总体=true
+   [PASS] I1: account balance equals sum of ledger deltas（检查 2 项）
+   [PASS] I2: commission ledger linkage and allocation cap（检查 1 项）
+```
+
+最小可用代码：
+
 ```go
 package main
 
@@ -59,49 +95,69 @@ import (
 	"time"
 
 	"github.com/im10furry/distledger"
-	memstore "github.com/im10furry/distledger/store/memory"
+	"github.com/im10furry/distledger/store/memory"
 )
 
 func main() {
 	ctx := context.Background()
+	clock := distledger.NewManualClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 
-	led, _ := distledger.New(distledger.Config{
-		Store: memstore.New(), // 内存 store，零外部依赖
-		Rules: distledger.Rules{Levels: 2, RateBP: []int{500, 200}, FreezeDays: 7},
+	led, err := distledger.New(distledger.Config{
+		Store: memory.New(), // 内存 store，零外部依赖
+		Clock: clock,
+		Rules: distledger.Rules{
+			Levels:     2,
+			RateBP:     []distledger.Rate{500, 200}, // 一级 5%，二级 2%
+			FreezeDays: 7,
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer led.Close()
+
+	const tenant = int64(0)
+
+	// 关系链：A(1001) ← B(1002)
+	_, _ = led.BindAgent(ctx, distledger.BindAgentRequest{
+		TenantID: tenant, UserID: 1001, Status: distledger.AgentActive,
+	})
+	_, _ = led.BindAgent(ctx, distledger.BindAgentRequest{
+		TenantID: tenant, UserID: 1002, ParentID: 1001, Status: distledger.AgentActive,
 	})
 
-	// A(1001) 邀请 B(1002)，B 推荐 C(1003) 下单
-	_ = led.BindAgent(ctx, 0, 1001, 0)
-	_ = led.BindAgent(ctx, 0, 1002, 1001)
+	// B 邀请 C(1003)
+	_, _ = led.BindBuyer(ctx, distledger.BindBuyerRequest{
+		TenantID: tenant, BuyerUserID: 1003, AgentUserID: 1002, Source: distledger.SourceLink,
+	})
 
-	now := time.Now()
+	// C 下单 199 元
 	res, _ := led.OnOrderPaid(ctx, distledger.OrderPaidEvent{
-		OrderID: "ORD-1", BuyerID: 1003, PaidAmount: 19900, PaidAt: now,
+		TenantID: tenant, OrderID: "ORD-1", BuyerUserID: 1003,
+		PaidAmount: distledger.Money(19900), PaidAt: clock.Now(),
 	})
-	fmt.Println("产生佣金笔数:", len(res.Commissions)) // 2
+	fmt.Println("佣金笔数:", len(res.Commissions)) // 2
 
-	// 收货 → 7 天后解冻
-	_ = led.OnOrderReceived(ctx, distledger.OrderReceivedEvent{OrderID: "ORD-1", ReceivedAt: now})
-	_, _ = led.Maintain(ctx, now.AddDate(0, 0, 8))
-
-	bal, _ := led.Balance(ctx, 0, 1001)
-	fmt.Println("可提现:", bal.Available)
-
-	// 退款 → 自动冲正
-	_, _ = led.OnOrderRefunded(ctx, distledger.OrderRefundedEvent{
-		OrderID: "ORD-1", RefundAmount: 19900, IsFull: true, RefundedAt: now,
+	// 收货 → 冻结 7 天 → 推进 8 天 → 结算
+	_, _ = led.OnOrderReceived(ctx, distledger.OrderReceivedEvent{
+		TenantID: tenant, OrderID: "ORD-1", ReceivedAt: clock.Now(),
 	})
-	bal, _ = led.Balance(ctx, 0, 1001)
-	fmt.Println("退款后可提现:", bal.Available)
+	clock.Advance(8 * 24 * time.Hour)
+	_, _ = led.Maintain(ctx, time.Time{})
+
+	bal, _ := led.Balance(ctx, tenant, 1001)
+	fmt.Println("A 可提现:", bal.Available)
 }
 ```
 
-**核心 API 只有两个入口 + 一个心跳：**
+**核心 API 只有三个事件入口 + 一个心跳：**
 
 | API | 用途 |
 |---|---|
-| `OnOrderPaid` / `OnOrderReceived` / `OnOrderRefunded` | 告诉库"业务发生了什么"（**全部幂等，可无脑重试**） |
-| `Maintain(ctx, now)` | 推进所有时间驱动的状态（冻结到期、结算、超时）—— 挂到你的 cron 即可 |
+| `OnOrderPaid` | 订单支付成功 → 归因 → 分佣 → 入账（**幂等，可无脑重试**） |
+| `OnOrderReceived` | 确认收货 → 用**快照的**冻结天数确定到账时间（**先到先得**） |
+| `OnOrderRefunded` | ⏳ v0.3 |
+| `Maintain(ctx, now)` | 推进所有时间驱动的状态 —— 挂到你的 cron 即可 |
 
 ---
 
@@ -110,43 +166,56 @@ func main() {
 ```
 □ go get github.com/im10furry/distledger
 □ go run ./examples/01-quickstart          → 30 秒看到佣金数字
-□ Store 换成 mysqlstore + 调 Migrate()      → 表已建好
-□ 订单支付成功后调 OnOrderPaid()            → 佣金出现在 dist_commission
+□ Rules 里显式配置 RateBP                  → 默认费率是 0（刻意，见 ADR-010）
+□ 订单支付成功后调 OnOrderPaid()            → 佣金出现在「待结算」
 □ 收货后调 OnOrderReceived()                → available_at 已写入
-□ cron 每小时调 Maintain()                  → 冻结到期自动结算
-□ 提现：RequestWithdraw → Approve → MarkWithdrawPaid
-□ led.SelfCheck() 全部 PASS                 → 接入完成
+□ cron 每分钟调 Maintain()                  → 冻结到期自动结算
+□ led.SelfCheck(ctx, tenant) 全部 PASS      → 接入完成
 ```
 
 **接入已有系统的目标成本：新增代码 ≤ 50 行，不改订单表结构，不接管你的生命周期。**
 
 ---
 
+## 三个「必须知道」的行为约定
+
+这三条都是刻意的，且都防住了真实的资损或纠纷：
+
+1. **`PaidAt` 必填。** 库不会用「当前时间」代替它。否则一次发生在绑定建立之前的重放，会被追认为有效归因 —— 相当于给"事后抢单"留了一道门（见 ADR-018）。
+2. **归因只在支付时刻成立。** 绑定必须**在支付之前**已经存在且有效。订单支付后补建的绑定不会追认这笔收益。
+3. **冻结期在入账时快照。** 之后修改全局 `FreezeDays` 不会改变已入账佣金的到账时间。已经承诺给分销员的时间不会被一次配置变更单方面推翻（见 ADR-005）。
+
+---
+
 ## 数据模型
 
-7 张表：
+v0.1 落地 6 张逻辑表（内存 Store 实现）：
 
 | 表 | 作用 |
 |---|---|
-| `dist_agent` | 分销员 + 关系链（物化路径 `path`） |
-| `dist_binding` | 绑定 / 归因（支持有效期、换绑） |
-| `dist_commission` | 佣金单，**不可变**，含费率/基数/冻结期**快照** |
-| `dist_account` | 账户（待结算 / 可提现 / 提现中 / 已提现） |
+| `dist_agent` | 分销员 + 关系链（父指针 + 深度） |
+| `dist_binding` | 绑定 / 归因（首次优先、有效期、可审计换绑） |
+| `dist_commission` | 佣金单，**财务字段不可变**，含费率/基数/冻结期**快照** |
+| `dist_account` | 账户（待结算 / 可提现 / 提现中 / 已提现 / 累计） |
 | `dist_ledger` | 资金流水，**复式只追加** |
-| `dist_withdraw` | 提现单 + 状态机 |
-| `dist_rule_version` | 规则版本（改费率不污染历史） |
+| `dist_withdraw` | ⏳ v0.5 |
 
 详见 [PRD.md §6](PRD.md#6-领域模型)。
 
 ---
 
-## 三条不变量
+## 两条不变量
 
-这是本库存在的全部意义，也是测试的重点：
+这是本库存在的全部意义，也是 `SelfCheck` 每天该跑的东西：
 
-1. **余额永远等于流水之和**：`SUM(dist_ledger.delta_*) == dist_account.*`
-2. **分佣总额不超过可分配上限**：`SUM(佣金绝对值) <= order.allocatable_cap`
-3. **任意退款序列后净额非负**：`净佣金 == 已结算 - 已冲正 >= 0`
+| 编号 | 不变量 | 检查方式 |
+|---|---|---|
+| **I1** | 账户余额 == 流水增量之和（且最后一条流水的 `After*` 与账户一致，且无负余额） | `SelfCheck` 遍历账户与流水重新求和比对 |
+| **I2** | 每条佣金都有对应的入账流水（双向引用完整），且每个计算单位分出的佣金不超过配额 | `SelfCheck` 双向枚举 + 配额校验 |
+
+> I3（任意退款序列后净额非负）随 v0.3 的退款冲正一起交付。
+
+**测试策略**：不变量优先。随机事件序列（含重复投递、乱序收货、时间跳跃）40 组种子 + 并发投递 + `-race`，全部要求自检通过。
 
 ---
 
@@ -163,6 +232,8 @@ func main() {
 分销在中国受《禁止传销条例》《刑法》第 224 条之一约束。本库**只提供账务能力，不提供合规判断**。
 
 使用者必须自行确保：层级 ≤ 3 级 · 计酬以真实成交为基数 · 不以缴费作为参与条件 · 资金不走"二清"。
+
+库层面已经做的兜底：`Levels` 上限**硬编码为 3**（不可配置），且**不提供**任何按拉人头/注册人数计酬的能力。
 
 > **卖货分佣合法，拉人分钱违法。本库只帮前者。**
 
@@ -184,4 +255,4 @@ func main() {
 - ✅ 不变量测试、边界用例、文档修正、示例补充
 - ✅ 新的 `Store` 实现（PostgreSQL / SQLite / Redis）
 - ✅ 新的 `PayoutChannel` 实现（微信 / 支付宝 / 银行卡）
-- ❌ 向核心加入"玩法"（团队计酬 / 区域分红 / 链动）—— 这类能力只能作为第三方 `Calculator` 实现存在
+- ❌ 向核心加入"玩法"（团队计酬 / 区域分红 / 链动）—— 这类能力只能作为第三方 `RateResolver` 实现存在

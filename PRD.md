@@ -192,7 +192,7 @@
 | `available_at` | BIGINT | 可提现时点 = 收货时间 + `freeze_days` |
 | `rule_version` | BIGINT | 命中的规则版本号 |
 | `rule_snapshot` | TEXT | 命中规则的 JSON 快照（可解释性） |
-| `reverse_of` | BIGINT | 冲正时指向原佣金单 |
+| `reverse_of` | BIGINT | 冲正时指向原佣金单（**v0.3 引入**，v0.1 不含该字段，避免恒为零的空壳字段） |
 | `accrue_at` / `settle_at` | BIGINT | |
 
 ⭐ **`freeze_days` 快照是刻意的**：Golershop 用"全局配置 + 收货时间戳"在查询时推导可提现时点，改配置会**污染历史订单**。本库把冻结期在入账时快照下来，历史永不受配置变更影响。
@@ -303,47 +303,48 @@ type OrderClosedEvent struct { TenantID int64; OrderID string; ClosedAt time.Tim
 
 ### 9.1 核心接口
 
+`Ledger` 是一个具体类型而不是接口——它只有一种实现，抽象成接口只会让调用方
+多写一层包装。可替换的是它依赖的 `Store`、`RateResolver`、`EligibilityChecker`。
+
 ```go
-package distledger
+// 事件入口：全部幂等，可安全重试
+func (l *Ledger) OnOrderPaid(ctx context.Context, ev OrderPaidEvent) (AccrueResult, error)
+func (l *Ledger) OnOrderReceived(ctx context.Context, ev OrderReceivedEvent) (ReceiveResult, error)
 
-type Ledger interface {
-    // ── 业务事件入口（全部幂等，可安全重试）──
-    OnOrderPaid(ctx context.Context, ev OrderPaidEvent) (AccrueResult, error)
-    OnOrderReceived(ctx context.Context, ev OrderReceivedEvent) error
-    OnOrderRefunded(ctx context.Context, ev OrderRefundedEvent) (ReverseResult, error)
-    OnOrderClosed(ctx context.Context, ev OrderClosedEvent) error
+// 心跳：推进所有时间驱动的状态（冻结到期 → 结算）
+func (l *Ledger) Maintain(ctx context.Context, now time.Time) (MaintainResult, error)
 
-    // ── 心跳：推进所有时间驱动的状态（冻结到期、结算、超时）──
-    Maintain(ctx context.Context, now time.Time) (MaintainResult, error)
+// 关系链
+func (l *Ledger) BindAgent(ctx context.Context, req BindAgentRequest) (Agent, error)
+func (l *Ledger) BindBuyer(ctx context.Context, req BindBuyerRequest) (Binding, error)
 
-    // ── 查询 ──
-    Balance(ctx context.Context, tenantID, userID int64) (Balance, error)
-    Commissions(ctx context.Context, q CommissionQuery) ([]Commission, error)
-    LedgerEntries(ctx context.Context, q LedgerQuery) ([]LedgerEntry, error)
-    Team(ctx context.Context, tenantID, userID int64, depth int) ([]Agent, error)
+// 查询
+func (l *Ledger) Agent(ctx context.Context, tenantID, userID int64) (Agent, error)
+func (l *Ledger) Balance(ctx context.Context, tenantID, userID int64) (Account, error)
+func (l *Ledger) CommissionsByOrder(ctx context.Context, tenantID int64, orderID string) ([]Commission, error)
+func (l *Ledger) CommissionsByAgent(ctx context.Context, tenantID, userID int64, q CommissionQuery) ([]Commission, error)
+func (l *Ledger) LedgerEntries(ctx context.Context, tenantID, userID int64, q LedgerQuery) ([]LedgerEntry, error)
 
-    // ── 提现 ──
-    RequestWithdraw(ctx context.Context, req WithdrawRequest) (WithdrawOrder, error)
-    ApproveWithdraw(ctx context.Context, id int64, operator string) error
-    RejectWithdraw(ctx context.Context, id int64, operator, reason string) error
-    MarkWithdrawPaid(ctx context.Context, id int64, ref PayoutRef) error
-
-    // ── 运维 ──
-    SelfCheck(ctx context.Context, tenantID int64) (Report, error)
-}
+// 运维
+func (l *Ledger) SelfCheck(ctx context.Context, tenantID int64) (Report, error)
+func (l *Ledger) Rules() Rules
+func (l *Ledger) Now() time.Time
+func (l *Ledger) Close() error
 ```
 
 ### 9.2 构造函数
 
 ```go
 led, err := distledger.New(distledger.Config{
-    Store:  memstore.New(),               // 或 mysqlstore.Open(db)
-    Rules:  distledger.DefaultRules(),    // 或结构化配置 / 自定义实现
-    Payout: manual.New(),                 // 默认人工打款
-    Clock:  distledger.SystemClock(),     // 测试可注入
+    Store:  memory.New(),              // 或 mysqlstore.Open(db)
+    Rules:  distledger.DefaultRules(), // 或结构化配置 / 自定义实现
+    Clock:  distledger.SystemClock(),  // 测试可注入 ManualClock
     Logger: slog.Default(),
 })
 ```
+
+配置不自洽时 `New` 直接返回错误，而不是"尽力而为"：带着错误规则跑起来的结果
+是发出错误的钱，而那不可撤销。
 
 ### 9.3 规则层三段式（配置优先，接口兜底）
 
@@ -412,58 +413,50 @@ type Binder interface {
 
 ### 10.3 目标 Quickstart（北极星 API，作为 G1/G2 的验收样例）
 
-**目标：≤30 行，不需要 MySQL，跑出真实佣金数字。**
+**已交付**：`examples/01-quickstart` 就是这个样例，`go run` 即可运行。
 
 ```go
-package main
+led, _ := distledger.New(distledger.Config{
+	Store: memory.New(),
+	Clock: distledger.NewManualClock(time.Now()),
+	Rules: distledger.Rules{
+		Levels: 2, RateBP: []distledger.Rate{500, 200}, FreezeDays: 7,
+	},
+})
 
-import (
-	"context"
-	"fmt"
-	"time"
+// 关系链：A(1001) ← B(1002)
+led.BindAgent(ctx, distledger.BindAgentRequest{
+	TenantID: 0, UserID: 1001, Status: distledger.AgentActive,
+})
+led.BindAgent(ctx, distledger.BindAgentRequest{
+	TenantID: 0, UserID: 1002, ParentID: 1001, Status: distledger.AgentActive,
+})
+led.BindBuyer(ctx, distledger.BindBuyerRequest{
+	TenantID: 0, BuyerUserID: 1003, AgentUserID: 1002, Source: distledger.SourceLink,
+})
 
-	"github.com/im10furry/distledger"
-	memstore "github.com/im10furry/distledger/store/memory"
-)
+// C(1003) 下单 199 元
+res, _ := led.OnOrderPaid(ctx, distledger.OrderPaidEvent{
+	TenantID: 0, OrderID: "ORD-1", BuyerUserID: 1003,
+	PaidAmount: distledger.Money(19900), PaidAt: clock.Now(),
+})
+// len(res.Commissions) == 2，且 res.Skipped 会解释每一级为什么没发钱
 
-func main() {
-	ctx := context.Background()
+// 收货 → 冻结 7 天 → 推进时间 → 结算
+led.OnOrderReceived(ctx, distledger.OrderReceivedEvent{
+	TenantID: 0, OrderID: "ORD-1", ReceivedAt: clock.Now(),
+})
+clock.Advance(8 * 24 * time.Hour)
+led.Maintain(ctx, time.Time{})
 
-	// 1) 建库：内存 store，零外部依赖
-	led, _ := distledger.New(distledger.Config{
-		Store: memstore.New(),
-		Rules: distledger.Rules{Levels: 2, RateBP: []int{500, 200}, FreezeDays: 7},
-	})
-
-	// 2) 建立关系：A(1001) 邀请 B(1002)
-	_ = led.BindAgent(ctx, 0, 1001, 0)          // A 成为分销员，无上级
-	_ = led.BindAgent(ctx, 0, 1002, 1001)       // B 的上级是 A
-
-	now := time.Now()
-
-	// 3) B 推荐 C(1003) 下单 199 元
-	res, _ := led.OnOrderPaid(ctx, distledger.OrderPaidEvent{
-		OrderID: "ORD-1", BuyerID: 1003, PaidAmount: 19900, PaidAt: now,
-	})
-	fmt.Println("产生佣金笔数:", len(res.Commissions)) // 2（含 B 的上级 A）
-
-	// 4) 收货 → 7 天后可提现
-	_ = led.OnOrderReceived(ctx, distledger.OrderReceivedEvent{
-		OrderID: "ORD-1", ReceivedAt: now,
-	})
-	_, _ = led.Maintain(ctx, now.AddDate(0, 0, 8)) // 推进时间，触发解冻
-
-	bal, _ := led.Balance(ctx, 0, 1001)
-	fmt.Println("A 可提现:", bal.Available) // 佣金已解冻
-
-	// 5) 退款 → 自动冲正
-	_, _ = led.OnOrderRefunded(ctx, distledger.OrderRefundedEvent{
-		OrderID: "ORD-1", RefundAmount: 19900, IsFull: true, RefundedAt: now,
-	})
-	bal, _ = led.Balance(ctx, 0, 1001)
-	fmt.Println("退款后 A 可提现:", bal.Available)
-}
+bal, _ := led.Balance(ctx, 0, 1001) // 佣金已从「待结算」进入「可提现」
 ```
+
+**三个必须知道的约定**（都来自实现期的安全审查，见 ADR-018）：
+
+1. `PaidAt` 必填，库不会用当前时间代替 —— 否则重放会被用来事后抢单。
+2. 归因只在支付时刻成立：绑定必须**早于**支付时间。
+3. 冻结期在入账时快照，改全局配置不影响历史。
 
 ### 10.4 五个递进示例（学习路径）
 
@@ -504,18 +497,21 @@ func main() {
 
 ## 11. 配置与安全默认值
 
+> **v0.1 只实现了下表中标注 ✅ 的项。** 未实现的项不会被"预留"成空壳配置——
+> 用户设了却不生效的配置比缺少功能更危险（见 ADR-022）。
+
 | 配置项 | 默认值 | 说明 | 为什么这个默认 |
 |---|---|---|---|
-| `Levels` | `2` | 分销层级数 | 合规保守（≤3 是法律红线，默认留一级余量） |
-| `RateBP` | `[]int{0, 0}` | 各级费率（万分比） | **默认不发钱**（R2） |
-| `FreezeDays` | `7` | 收货后 N 天可提现 | 覆盖售后窗口；入账时**快照** |
-| `MinWithdraw` | `10000` | 起提门槛（100 元） | 避免小额打款成本倒挂 |
-| `FeeRateBP` | `0` | 提现手续费 | 不额外收钱 |
-| `SelfPurchase` | `false` | 自购是否分佣 | 自购返利是刷单温床，默认关 |
-| `AllowNegative` | `false` | 冲正是否允许负余额 | 默认不允许，避免追债纠纷 |
-| `AutoPayout` | `false` | 是否自动打款 | 默认人工审核闸门 |
-| `BindType` | `末次点击` | 归因方式 | 与主流一致 |
-| `BindExpireDays` | `0`（永久） | 绑定有效期 | 显式配置才过期 |
+| ✅ `Levels` | `2` | 分销层级数 | 合规保守（≤3 是法律红线，默认留一级余量） |
+| ✅ `RateBP` | `[]Rate{0, 0}` | 各级费率（万分比） | **默认不发钱**（R2） |
+| ✅ `FreezeDays` | `7` | 收货后 N 天可提现 | 覆盖售后窗口；入账时**快照** |
+| ⏳ `MinWithdraw` | `10000` | 起提门槛（100 元） | 避免小额打款成本倒挂 |
+| ⏳ `FeeRateBP` | `0` | 提现手续费 | 不额外收钱 |
+| ⏳ `SelfPurchase` | `false` | 自购是否分佣 | 自购返利是刷单温床，默认关 |
+| ⏳ `AllowNegative` | `false` | 冲正是否允许负余额 | 默认不允许，避免追债纠纷 |
+| ⏳ `AutoPayout` | `false` | 是否自动打款 | 默认人工审核闸门 |
+| ⏳ `BindType` | `首次点击` | 归因方式（v0.1 固定为首位优先，不可配） | 防抢客优先于灵活 |
+| ✅ `BindExpireDays` | `0`（永久） | 绑定有效期 | 显式配置才过期 |
 
 ---
 
@@ -526,8 +522,8 @@ func main() {
 | 编号 | 不变量 | 违反后果 |
 |---|---|---|
 | **I1** | `SUM(dist_ledger.delta_*) == dist_account.*`（余额永远等于流水之和） | 账实不符 |
-| **I2** | `SUM(佣金绝对值) <= order.allocatable_cap`（分佣总额不超过可分配上限） | 平台每单亏损 |
-| **I3** | 任意退款序列结束后：`SUM(净佣金) >= 0` 且 `净佣金 == 已结算 - 已冲正` | 负数发钱 |
+| **I2** | 每个计算单位的佣金合计 ≤ 该单位基数 × `MaxAllocatableBP`，且每条佣金都能双向追溯到入账流水 | 平台每单亏损 / 记了佣金却没动钱 |
+| **I3** | 任意退款序列结束后：`SUM(净佣金) >= 0` 且 `净佣金 == 已结算 - 已冲正`（**随 v0.3 交付**） | 负数发钱 |
 
 ### 12.2 测试策略（**先写测试，再写实现**）
 
@@ -543,8 +539,8 @@ func main() {
 
 | 版本 | 范围 | 验收 |
 |---|---|---|
-| **v0.1**（alpha） | 内存 store + 一级分佣 + 幂等键 + I1 不变量 | `examples/01` 可跑 |
-| **v0.2** | 多级分佣 + 规则配置 + 冻结期快照 + I2 | `examples/02` 可跑 |
+| **v0.1** ✅ 已交付 | 内存 store + 关系链 + 归因 + 多级分佣 + 幂等键 + 冻结快照 + `Maintain` 结算 + I1/I2 自检 | `examples/01` 可跑；`-race` 全绿；覆盖率 88.7%/93.5%/92.9% |
+| **v0.2** | 规则层扩展（等级费率、SKU 级覆盖）+ `examples/02` | 规则可插拔验证 |
 | **v0.3** | 退款冲正（全退/部分退/已结算追回）+ I3 | `examples/03` 可跑 |
 | **v0.4** | MySQL store + 事务/乐观锁 + `Migrate` | 生产可用 |
 | **v0.5** | 提现链路 + `PayoutChannel` + `ManualChannel` | `examples/04` 可跑 |
@@ -564,32 +560,29 @@ distledger/
 ├── README.md                 # 面向开发者：3 屏内讲完 + Quickstart
 ├── PRD.md                    # 本文档
 ├── CHANGELOG.md
-├── ledger.go                 # Ledger 接口 + New()
-├── event.go                  # 事件结构体（纯 struct）
-├── rule.go                   # Rules / Calculator / Eligibility / Binder
-├── errors.go                 # 哨兵错误（含 ErrNotImplemented、ErrIllegalTransition）
-├── clock.go                  # Clock 抽象（禁止直接 time.Now()）
-├── internal/
-│   ├── engine/               # 内核：状态机 + 不变量校验（唯一写死的地方）
-│   ├── accrue/               # 归因编排
-│   ├── reverse/              # 退款冲正
-│   └── settle/               # 冻结 / 结算
-├── store/
-│   ├── store.go              # Store 接口（持久化端口）
-│   ├── memory/               # 内存实现 ⭐ 零依赖体验 + 单测
-│   └── mysql/
-│       ├── schema.sql
-│       └── migrate.go
-├── payout/
-│   ├── payout.go             # PayoutChannel 接口
-│   ├── manual/               # 人工打款（默认）
-│   └── mock/                 # 测试用
-├── examples/
-│   └── 01-quickstart … 05-mysql-adapter
+│
+├── doc.go                    # 包文档与设计铁律速览
+├── money.go                  # Money / Rate / Rounding + 防溢出运算
+├── errors.go                 # 哨兵错误 + 类型化错误（FieldError / TransitionError / ConflictError）
+├── clock.go                  # Clock 抽象 + ManualClock（禁止直接 time.Now()）
+├── keys.go                   # UserKey / OrderKey + 长度上限
+├── idem.go                   # 幂等键派生（长度前缀哈希）
+├── model.go                  # 领域类型：Agent / Binding / Commission / Account / LedgerEntry
+├── state.go                  # 佣金状态迁移表（内核中唯一写死的部分）
+├── rule.go                   # Rules / RateResolver / EligibilityChecker
+├── event.go                  # 事件与结果（纯 struct，无 codegen）
+├── store.go                  # 持久化端口：Store / Reader / Writer / Tx
+├── ledger.go                 # 门面：New / BindAgent / BindBuyer / 查询
+├── accrual.go                # 分佣引擎
+├── settle.go                 # 冻结、收货、Maintain 结算
+├── selfcheck.go              # 不变量 I1 / I2 校验
+│
+├── internal/safemath/        # 128 位乘除与溢出检测原语
+├── store/memory/             # 内存实现（事务回滚 / 键集分页 / 到期索引）
+├── examples/01-quickstart/   # 零依赖可运行示例
 └── docs/
-    ├── design-decisions.md   # 关键决策记录（ADR 风格）
-    ├── integration.md        # 接入指南
-    └── invariants.md         # 三条不变量的形式化描述
+    ├── design-decisions.md   # 22 条 ADR：每个"刻意为之"的取舍与代价
+    └── invariants.md         # ⏳ v0.3
 ```
 
 ### 工程规范
