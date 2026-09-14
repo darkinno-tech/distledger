@@ -10,11 +10,12 @@ import (
 	"github.com/im10furry/distledger"
 )
 
-// tx 是事务内的读写句柄。
+// tx is the read-write handle used inside a transaction.
 //
-// 它内嵌 reader：读操作直接落到同一份数据上，因此**天然读得到本事务
-// 已写入的内容**（read-your-writes），不需要额外维护影子副本。
-// 未提交的数据不会被其它事务看到，因为写锁在整个事务期间持有。
+// It embeds reader, so reads hit the same maps the transaction is writing. That
+// gives read-your-writes for free without maintaining a shadow copy, and
+// uncommitted data stays invisible to other transactions because the write lock
+// is held for the whole transaction.
 type tx struct {
 	reader
 	u *undo
@@ -87,8 +88,8 @@ func (t *tx) PutAccount(ctx context.Context, a distledger.Account) (distledger.A
 	if err := a.Key.Validate(); err != nil {
 		return a, err
 	}
-	// 负余额在这里就被拦下，而不是等到对账时才发现。
-	// 这是不变量 I1 的第一道防线。
+	// Negative buckets are rejected here rather than being discovered during
+	// reconciliation. This is the first line of defence for invariant I1.
 	if !a.Settleable() {
 		return a, fieldErrf("account",
 			"negative bucket balance: frozen=%s available=%s withdrawing=%s withdrawn=%s",
@@ -102,6 +103,9 @@ func (t *tx) PutAccount(ctx context.Context, a distledger.Account) (distledger.A
 	}
 
 	saveAccount(t.u, d, a.Key)
+	if !existed {
+		insertAccountID(d, t.u, a.Key)
+	}
 	a.Version++
 	d.accounts[a.Key] = a
 	return a, nil
@@ -126,11 +130,19 @@ func (t *tx) AppendCommission(ctx context.Context, c distledger.Commission) (dis
 	if !c.State.Valid() {
 		return c, fieldErrf("state", "unknown commission state %d", uint8(c.State))
 	}
+	if c.ReversedAmount < 0 || c.ReversedAmount > c.MaxReversible() {
+		return c, fieldErrf("reversed_amount",
+			"must be within [0, %s]; got %s", c.MaxReversible(), c.ReversedAmount)
+	}
+	if c.ReverseOf < 0 {
+		return c, fieldErrf("reverse_of", "must be >= 0, got %d", c.ReverseOf)
+	}
 
 	d := t.reader.d
 	ref := idemRef{tenantID: c.Key.TenantID, key: c.IdemKey}
 	if _, dup := d.idem[ref]; dup {
-		// 幂等命中。调用方应当把它当作「已经记过账」而非失败。
+		// Idempotency hit. Callers should treat this as "already booked"
+		// rather than as a failure.
 		return c, distledger.ErrDuplicate
 	}
 
@@ -143,15 +155,15 @@ func (t *tx) AppendCommission(ctx context.Context, c distledger.Commission) (dis
 	d.commissions[c.ID] = c
 	d.commissionIDs = append(d.commissionIDs, c.ID)
 
-	t.u.truncByOrder(d, c.Key)
+	noteAppendIndex(t.u.byOrder, d.byOrder, c.Key)
 	d.byOrder[c.Key] = append(d.byOrder[c.Key], c.ID)
 
 	agentKey := distledger.UserKey{TenantID: c.Key.TenantID, UserID: c.AgentUserID}
-	t.u.truncByAgent(d, agentKey)
+	noteAppendIndex(t.u.byAgent, d.byAgent, agentKey)
 	d.byAgent[agentKey] = append(d.byAgent[agentKey], c.ID)
 
-	if c.State == distledger.CommissionPending && !c.AvailableAt.IsZero() {
-		insertDue(d, t.u, c.AvailableAt, c.ID)
+	if dueTracked(c.State) && !c.AvailableAt.IsZero() {
+		insertDue(d, t.u, c.Key.TenantID, c.AvailableAt, c.ID)
 	}
 	return c, nil
 }
@@ -165,10 +177,11 @@ func (t *tx) SetCommissionAvailableAt(ctx context.Context, id int64, at time.Tim
 	if !ok {
 		return distledger.Commission{}, distledger.ErrNotFound
 	}
-	// 先到先得：到账时间一旦确定就不再改变。
+	// First write wins: once the settlement date is fixed it never changes.
 	//
-	// 这条规则防的是「用重复投递把到账时间往前刷」——如果没有它，
-	// 分销员只要反复触发收货回调就能提前提现。
+	// The rule defends against replaying a receipt event to pull the settlement
+	// date forward. Without it, a agent could unlock their commission
+	// simply by re-triggering the callback.
 	if !c.AvailableAt.IsZero() {
 		return c, nil
 	}
@@ -183,9 +196,41 @@ func (t *tx) SetCommissionAvailableAt(ctx context.Context, id int64, at time.Tim
 	c.Version++
 	d.commissions[id] = c
 
-	if c.State == distledger.CommissionPending {
-		insertDue(d, t.u, c.AvailableAt, id)
+	if dueTracked(c.State) {
+		insertDue(d, t.u, c.Key.TenantID, c.AvailableAt, id)
 	}
+	return c, nil
+}
+
+func (t *tx) SetCommissionReversedAmount(ctx context.Context, id int64, reversed distledger.Money, expectedVersion int64) (distledger.Commission, error) {
+	if err := ctx.Err(); err != nil {
+		return distledger.Commission{}, err
+	}
+	d := t.reader.d
+	c, ok := d.commissions[id]
+	if !ok {
+		return distledger.Commission{}, distledger.ErrNotFound
+	}
+	if reversed < 0 || reversed > c.MaxReversible() {
+		// The accumulator is bounded by the original amount. Letting it exceed
+		// that would let a refund claw back more than was ever accrued, which
+		// is exactly what invariant I3 exists to prevent.
+		return c, fieldErrf("reversed_amount",
+			"must be within [0, %s]; got %s", c.MaxReversible(), reversed)
+	}
+	if c.Version != expectedVersion {
+		return c, &distledger.ConflictError{
+			Kind: "commission", ID: id, Expected: expectedVersion, Actual: c.Version,
+		}
+	}
+	if c.ReversedAmount == reversed {
+		return c, nil
+	}
+
+	saveCommission(t.u, d, id)
+	c.ReversedAmount = reversed
+	c.Version++
+	d.commissions[id] = c
 	return c, nil
 }
 
@@ -199,8 +244,9 @@ func (t *tx) TransitionCommission(ctx context.Context, id int64, from, to distle
 		return distledger.Commission{}, distledger.ErrNotFound
 	}
 	if c.State != from {
-		// 当前状态与预期不符，说明有人已经推进过它。
-		// 这属于并发冲突而不是非法迁移，区分开才能让调用方正确重试。
+		// The current state is not what the caller expected, so somebody else
+		// already advanced it. That is a retryable conflict rather than an
+		// illegal transition, and the two must stay distinguishable.
 		return c, &distledger.ConflictError{
 			Kind: "commission state", ID: id, Expected: int64(from), Actual: int64(c.State),
 		}
@@ -219,12 +265,58 @@ func (t *tx) TransitionCommission(ctx context.Context, id int64, from, to distle
 	c.Version++
 	d.commissions[id] = c
 
-	// 离开待结算状态后，到期索引中的条目立即失效并从索引中移除，
-	// 避免索引随结算推进无限膨胀。
-	if from == distledger.CommissionPending && !c.AvailableAt.IsZero() {
-		removeDue(d, t.u, c.AvailableAt, id)
+	// Leaving the tracked set invalidates the settlement index entry straight
+	// away, so the index cannot grow without bound as settlement progresses.
+	//
+	// Freezing keeps the entry: the settlement date stays known, and a later
+	// unfreeze must make the commission settle immediately rather than strand
+	// it until somebody re-delivers the receipt event.
+	if !dueTracked(to) && !c.AvailableAt.IsZero() {
+		removeDue(d, t.u, c.Key.TenantID, c.AvailableAt, id)
 	}
 	return c, nil
+}
+
+// dueTracked reports whether a state keeps its settlement date in the index.
+func dueTracked(s distledger.CommissionState) bool {
+	return s == distledger.CommissionPending || s == distledger.CommissionFrozen
+}
+
+func (t *tx) AppendRefund(ctx context.Context, r distledger.Refund) (distledger.Refund, error) {
+	if err := ctx.Err(); err != nil {
+		return r, err
+	}
+	if err := r.Key.Validate(); err != nil {
+		return r, err
+	}
+	if r.IdemKey == "" {
+		return r, fieldErr("idem_key", "must not be empty")
+	}
+	if r.Amount <= 0 {
+		return r, fieldErrf("amount", "must be > 0, got %s", r.Amount)
+	}
+	if r.Cumulative < r.Amount {
+		return r, fieldErrf("cumulative",
+			"must be at least the instalment amount %s, got %s", r.Amount, r.Cumulative)
+	}
+
+	d := t.reader.d
+	ref := idemRef{tenantID: r.Key.TenantID, key: r.IdemKey}
+	if _, dup := d.refundIdem[ref]; dup {
+		return r, distledger.ErrDuplicate
+	}
+
+	d.nextID++
+	r.ID = d.nextID
+
+	saveRefundIdem(t.u, d, ref)
+	d.refundIdem[ref] = r.ID
+	saveRefund(t.u, d, r.ID)
+	d.refunds[r.ID] = r
+
+	noteAppendIndex(t.u.refundsByOrder, d.refundsByOrder, r.Key)
+	d.refundsByOrder[r.Key] = append(d.refundsByOrder[r.Key], r.ID)
+	return r, nil
 }
 
 func (t *tx) AppendLedger(ctx context.Context, e distledger.LedgerEntry) (distledger.LedgerEntry, error) {
@@ -248,23 +340,23 @@ func (t *tx) AppendLedger(ctx context.Context, e distledger.LedgerEntry) (distle
 
 	saveLedger(t.u, d, e.ID)
 	d.ledger[e.ID] = e
-
 	d.ledgerIDs = append(d.ledgerIDs, e.ID)
 
-	t.u.truncLedgerByUser(d, e.Key)
+	noteAppendIndex(t.u.ledgerByUser, d.ledgerByUser, e.Key)
 	d.ledgerByUser[e.Key] = append(d.ledgerByUser[e.Key], e.ID)
 
-	t.u.truncLedgerByTenant(d, e.Key.TenantID)
+	noteAppendIndex(t.u.ledgerByTenant, d.ledgerByTenant, e.Key.TenantID)
 	d.ledgerByTenant[e.Key.TenantID] = append(d.ledgerByTenant[e.Key.TenantID], e.ID)
 
 	return e, nil
 }
 
-// checkVersion 实现乐观锁校验。
+// checkVersion implements optimistic locking.
 //
-// 已存在期望版本必须相等；不存在时期望版本必须为 0（表示「我认为它是新的」）。
-// 这条规则让「两个事务同时创建同一个对象」也能被检测出来：
-// 后提交的那个会发现对象已存在而自己的期望版本是 0。
+// When the object already exists the expected version must match; when it does
+// not, the expected version must be zero, meaning "I believe this is new". That
+// rule also catches two transactions racing to create the same object: the one
+// that commits second finds it already there while expecting version zero.
 func checkVersion(kind, id string, expected, actual int64, existed bool) error {
 	if !existed {
 		if expected != 0 {
@@ -278,47 +370,60 @@ func checkVersion(kind, id string, expected, actual int64, existed bool) error {
 	return nil
 }
 
-// insertDue 把一项按 (at, id) 升序插入到期索引。
-func insertDue(d *data, u *undo, at time.Time, id int64) {
+// insertDue adds an entry to the settlement index, keeping it sorted by
+// (tenant, at, id).
+func insertDue(d *data, u *undo, tenantID int64, at time.Time, id int64) {
 	idx := d.pendingDue
-	pos := sort.Search(len(idx), func(i int) bool {
-		if idx[i].at.Equal(at) {
-			return idx[i].id >= id
-		}
-		return idx[i].at.After(at)
-	})
+	ref := dueRef{tenantID: tenantID, at: at.UTC(), id: id}
+	pos := sort.Search(len(idx), func(i int) bool { return !idx[i].less(ref) })
 	if pos == len(idx) {
-		// 尾部追加：回滚只需截断，代价 O(1)。
-		u.noteDueAppend(d)
-		d.pendingDue = append(idx, dueRef{at: at, id: id})
+		// Tail append: the rollback only needs the old length.
+		u.due.noteAppend(idx)
+		d.pendingDue = append(idx, ref)
 		return
 	}
-	// 中间插入：元素会被搬移，必须升级为全量快照。
-	u.noteDueStructural(d)
-	d.pendingDue = slices.Insert(idx, pos, dueRef{at: at, id: id})
+	// Middle insert: elements shift, so escalate to a full snapshot.
+	u.due.noteStructural(idx)
+	d.pendingDue = slices.Insert(idx, pos, ref)
 }
 
-// removeDue 从到期索引中移除一项。
-func removeDue(d *data, u *undo, at time.Time, id int64) {
+// removeDue drops an entry from the settlement index.
+func removeDue(d *data, u *undo, tenantID int64, at time.Time, id int64) {
 	idx := d.pendingDue
-	pos := sort.Search(len(idx), func(i int) bool {
-		if idx[i].at.Equal(at) {
-			return idx[i].id >= id
-		}
-		return idx[i].at.After(at)
-	})
-	if pos >= len(idx) || idx[pos].id != id || !idx[pos].at.Equal(at) {
+	ref := dueRef{tenantID: tenantID, at: at.UTC(), id: id}
+	pos := sort.Search(len(idx), func(i int) bool { return !idx[i].less(ref) })
+	if pos >= len(idx) || idx[pos] != ref {
 		return
 	}
-	u.noteDueStructural(d)
+	u.due.noteStructural(idx)
 	d.pendingDue = slices.Delete(idx, pos, pos+1)
 }
 
-// fieldErr / fieldErrf 在包内复用根包的校验错误格式。
+// insertAccountID keeps the account index sorted by (tenant, user).
+func insertAccountID(d *data, u *undo, key distledger.UserKey) {
+	idx := d.accountIDs
+	pos := sort.Search(len(idx), func(i int) bool {
+		if idx[i].TenantID != key.TenantID {
+			return idx[i].TenantID >= key.TenantID
+		}
+		return idx[i].UserID >= key.UserID
+	})
+	if pos < len(idx) && idx[pos] == key {
+		return
+	}
+	if pos == len(idx) {
+		u.accountIDs.noteAppend(idx)
+		d.accountIDs = append(idx, key)
+		return
+	}
+	u.accountIDs.noteStructural(idx)
+	d.accountIDs = slices.Insert(idx, pos, key)
+}
+
+// fieldErr / fieldErrf build the same validation errors the root package uses.
 //
-// 这里刻意不导出根包的构造函数，而是定义两个等价的本地函数：
-// 它们产生的错误同样能被 errors.Is(err, distledger.ErrInvalidArgument) 命中，
-// 因为根包的错误类型是导出的。
+// The constructors are not exported by the root package on purpose; the error
+// type is, so these still satisfy errors.Is(err, distledger.ErrInvalidArgument).
 func fieldErr(field, reason string) error {
 	return &distledger.FieldError{Field: field, Reason: reason}
 }

@@ -10,9 +10,11 @@ import (
 	"github.com/im10furry/distledger"
 )
 
-// 本文件覆盖读路径与写路径的校验分支。它们不参与资金计算，但决定了
-// 排障与对账能不能做成：一个筛不掉、翻不动的查询接口会让自检变成
-// 全表扫描，进而让「跑一次自检」这件事在数据量上来之后没人敢做。
+// This file covers the validation branches of the read and write paths. They
+// take no part in money arithmetic, but they decide whether troubleshooting
+// and reconciliation are even feasible: a query interface that cannot filter
+// or page turns self-checks into full table scans, so once the data volume
+// grows nobody dares to "run a self-check".
 
 func withTx(t *testing.T, s *Store, fn func(ctx context.Context, tx distledger.Tx) error) {
 	t.Helper()
@@ -197,7 +199,8 @@ func TestAppendLedgerValidation(t *testing.T) {
 
 func TestTenantsAreDeduplicatedAndSorted(t *testing.T) {
 	s := newStore(t)
-	// 同一个租户下多个用户，以及多个租户，都必须被去重并排序。
+	// Both multiple users under the same tenant and multiple tenants must be
+	// deduplicated and sorted.
 	for i, tn := range []int64{3, 1, 2, 1, 3} {
 		seedAgentIn(t, s, tn, int64(100+i))
 	}
@@ -410,9 +413,11 @@ func TestDueCommissionsFiltering(t *testing.T) {
 
 	due := mk(1, "DUE", time.Hour, distledger.CommissionPending)
 	mk(1, "FUTURE", 48*time.Hour, distledger.CommissionPending)
-	// 另一个租户的到期佣金绝不能出现在本租户的结果里。
+	// A due commission belonging to another tenant must never show up in this
+	// tenant's results.
 	mk(2, "OTHER-TENANT", time.Hour, distledger.CommissionPending)
-	// 已结算的佣金即使到期时间已过也不应出现（它根本没进到期索引）。
+	// A settled commission must not appear even when its due time has already
+	// passed (it never entered the due index).
 	mk(1, "SETTLED", time.Hour, distledger.CommissionSettled)
 
 	withRead(t, s, func(ctx context.Context, r distledger.Reader) error {
@@ -439,7 +444,7 @@ func TestDueCommissionsFiltering(t *testing.T) {
 			}
 		}
 
-		// limit 必须生效。
+		// limit must take effect.
 		limited, err := r.DueCommissions(ctx, 1, base.Add(2*time.Hour), 1)
 		if err != nil {
 			return err
@@ -448,7 +453,7 @@ func TestDueCommissionsFiltering(t *testing.T) {
 			t.Fatalf("limit=1 returned %d rows", len(limited))
 		}
 
-		// 没有任何到期项时应当迅速返回空。
+		// With nothing due it must return empty promptly.
 		none, err := r.DueCommissions(ctx, 1, base.Add(-time.Hour), 100)
 		if err != nil {
 			return err
@@ -470,7 +475,8 @@ func TestDueCommissionsSkipsStaleIndexEntries(t *testing.T) {
 		return err
 	})
 
-	// 直接篡改佣金状态，制造「索引说它到期了、实际它已经结算」的失效状态。
+	// Tamper with the commission state directly to fabricate a stale index
+	// entry that claims the commission is due while it has actually settled.
 	s.mu.Lock()
 	stale := s.d.commissions[c.ID]
 	stale.State = distledger.CommissionSettled
@@ -546,7 +552,8 @@ func TestSetCommissionAvailableAtIsIdempotent(t *testing.T) {
 		t.Fatalf("AvailableAt = %s, want %s", first.AvailableAt, base)
 	}
 
-	// 第二次用一个明显更早的时间，必须被忽略（先到先得）。
+	// The second call passes a clearly earlier time and must be ignored
+	// (first writer wins).
 	withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
 		second, err := tx.SetCommissionAvailableAt(ctx, c.ID, base.Add(-time.Hour), first.Version)
 		if err != nil {
@@ -604,7 +611,7 @@ func TestPutBindingInsertAndUpdate(t *testing.T) {
 		return nil
 	})
 
-	// 更新：换绑到另一个分销员，并标记 ReboundFrom 以便审计。
+	// Update: rebind to a different agent and record ReboundFrom for auditing.
 	withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
 		cur, err := tx.Binding(ctx, buyer)
 		if err != nil {
@@ -630,7 +637,7 @@ func TestPutBindingInsertAndUpdate(t *testing.T) {
 		return nil
 	})
 
-	// 用陈旧版本写入必须失败。
+	// Writing with a stale version must fail.
 	err := s.Update(context.Background(), func(ctx context.Context, tx distledger.Tx) error {
 		_, err := tx.PutBinding(ctx, created)
 		return err
@@ -684,34 +691,37 @@ func TestRemovingMissingDueEntryIsHarmless(t *testing.T) {
 	s := newStore(t)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	// 直接调用内部函数，验证「删除不存在的索引项」不会破坏索引。
+	// Call the internal helper directly to verify that removing a non-existent
+	// index entry does not corrupt the index.
 	before := len(s.d.pendingDue)
-	removeDue(s.d, newUndo(s.d), base, 999)
+	removeDue(s.d, newUndo(s.d), 0, base, 999)
 	if len(s.d.pendingDue) != before {
 		t.Fatalf("removing a missing entry changed the index length: %d -> %d",
 			before, len(s.d.pendingDue))
 	}
 
-	// 索引为空时也应安全。
-	insertDue(s.d, newUndo(s.d), base, 1)
+	// It must be safe with an empty index too.
+	insertDue(s.d, newUndo(s.d), 0, base, 1)
 	if len(s.d.pendingDue) != 1 {
 		t.Fatalf("insert into an empty index failed: %+v", s.d.pendingDue)
 	}
-	removeDue(s.d, newUndo(s.d), base, 2) // 到期时间相同但 ID 不同
+	removeDue(s.d, newUndo(s.d), 0, base, 2) // same due time but a different ID
 	if len(s.d.pendingDue) != 1 {
 		t.Fatal("removing a non-matching entry must be a no-op")
 	}
-	removeDue(s.d, newUndo(s.d), base, 1)
+	removeDue(s.d, newUndo(s.d), 0, base, 1)
 	if len(s.d.pendingDue) != 0 {
 		t.Fatal("removing the matching entry failed")
 	}
 }
 
-// TestReaderMethodsHonourCancellation 覆盖每个读方法的取消检查。
+// TestReaderMethodsHonourCancellation covers the cancellation check in every
+// read method.
 //
-// 这些分支在正常路径上永远不会执行，但它们决定了「用户点了取消之后，
-// 一次对账扫描要多久才停下来」。缺少它们，取消请求会等到整个扫描结束
-// 才生效——在千万级流水上那就是几十秒。
+// These branches never execute on the normal path, but they decide how long a
+// reconciliation scan takes to stop after a user hits cancel. Without them a
+// cancellation request only takes effect once the whole scan has finished --
+// on tens of millions of ledger rows that is tens of seconds.
 func TestReaderMethodsHonourCancellation(t *testing.T) {
 	s := newStore(t)
 	seedAgentIn(t, s, 1, 100)
@@ -804,9 +814,10 @@ func TestReaderMethodsHonourCancellation(t *testing.T) {
 	}
 }
 
-// TestTransactionTouchesSameEntityTwice 覆盖撤销日志中「同一对象只记录一次」
-// 的分支。它保证多次修改同一对象后回滚到的是**事务开始前**的状态，
-// 而不是第一次修改前的状态。
+// TestTransactionTouchesSameEntityTwice covers the "record each object only
+// once" branch of the undo log. It guarantees that after several modifications
+// to the same object, a rollback restores the state from **before the
+// transaction started**, not the state before the first modification.
 func TestTransactionTouchesSameEntityTwice(t *testing.T) {
 	s := newStore(t)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -820,7 +831,7 @@ func TestTransactionTouchesSameEntityTwice(t *testing.T) {
 	created := seedCommissionIn(t, s, 1, "ORD-1", 100, distledger.CommissionPending)
 
 	err := s.Update(context.Background(), func(ctx context.Context, tx distledger.Tx) error {
-		// 同一个账户改两次。
+		// The same account is modified twice.
 		for i := 0; i < 2; i++ {
 			acct, err := tx.Account(ctx, key)
 			if err != nil {
@@ -832,7 +843,7 @@ func TestTransactionTouchesSameEntityTwice(t *testing.T) {
 				return err
 			}
 		}
-		// 同一条佣金被两次不同的写操作触碰。
+		// The same commission is touched by two different write operations.
 		cur, err := tx.Commission(ctx, created.ID)
 		if err != nil {
 			return err
@@ -845,7 +856,7 @@ func TestTransactionTouchesSameEntityTwice(t *testing.T) {
 			distledger.CommissionPending, distledger.CommissionSettled, updated.Version); err != nil {
 			return err
 		}
-		// 同一个分销员改两次。
+		// The same agent is modified twice.
 		agent, err := tx.Agent(ctx, key)
 		if err != nil {
 			return err
@@ -895,8 +906,9 @@ func TestTransactionTouchesSameEntityTwice(t *testing.T) {
 	})
 }
 
-// TestMultipleDueAppendsInOneTransaction 覆盖到期索引在同一事务内多次
-// 尾部追加的情形：只有当**首次**追加时才需要记录长度快照。
+// TestMultipleDueAppendsInOneTransaction covers several tail appends to the
+// due index within a single transaction: the length snapshot only needs to be
+// recorded on the **first** append.
 func TestMultipleDueAppendsInOneTransaction(t *testing.T) {
 	s := newStore(t)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)

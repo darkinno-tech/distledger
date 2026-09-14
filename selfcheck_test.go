@@ -40,8 +40,8 @@ func TestSelfCheckPassesOnHealthyData(t *testing.T) {
 	if rep.StoreKind != "memory" {
 		t.Errorf("store kind = %q, want memory", rep.StoreKind)
 	}
-	if len(rep.Invariants) != 2 {
-		t.Fatalf("got %d invariants, want 2", len(rep.Invariants))
+	if len(rep.Invariants) != 3 {
+		t.Fatalf("got %d invariants, want 3", len(rep.Invariants))
 	}
 	for _, inv := range rep.Invariants {
 		if !inv.OK {
@@ -56,8 +56,8 @@ func TestSelfCheckPassesOnHealthyData(t *testing.T) {
 	}
 }
 
-// TestSelfCheckDetectsAccountWithoutLedger 覆盖最容易出现的破坏形态：
-// 有人直接改了账户余额，却忘了写流水。
+// TestSelfCheckDetectsAccountWithoutLedger covers the most common corruption
+// shape: someone edits an account balance directly and forgets the ledger entry.
 func TestSelfCheckDetectsAccountWithoutLedger(t *testing.T) {
 	f := newFixture(t, twoLevelRules())
 	ctx := context.Background()
@@ -79,7 +79,8 @@ func TestSelfCheckDetectsAccountWithoutLedger(t *testing.T) {
 	}
 }
 
-// TestSelfCheckDetectsLedgerSumMismatch 覆盖「流水被追加但账户没跟着更新」。
+// TestSelfCheckDetectsLedgerSumMismatch covers a ledger entry that was appended
+// without the matching account update.
 func TestSelfCheckDetectsLedgerSumMismatch(t *testing.T) {
 	f := newFixture(t, twoLevelRules())
 	f.healthy()
@@ -91,7 +92,7 @@ func TestSelfCheckDetectsLedgerSumMismatch(t *testing.T) {
 			BizType:     distledger.LedgerManualAdjust,
 			BizID:       "manual-1",
 			DeltaFrozen: 12345,
-			AfterFrozen: 99999, // 与账户真实值不符
+			AfterFrozen: 99999, // does not match the account's real value
 			CreatedAt:   f.clock.Now(),
 		})
 		return err
@@ -108,10 +109,12 @@ func TestSelfCheckDetectsLedgerSumMismatch(t *testing.T) {
 	}
 }
 
-// TestSelfCheckDetectsAdjustedAccount 验证「改了账户也改了流水」也能被发现。
+// TestSelfCheckDetectsAdjustedAccount verifies that tampering with both the
+// account and the ledger is still caught.
 //
-// 只比对「流水和 == 账户」是不够的：同时篡改两边可以让等式依然成立。
-// 因此 I1 还额外校验最后一条流水的 After* 与账户是否一致。
+// Comparing "ledger sum == account" alone is not enough: changing both sides
+// keeps the equation satisfied. I1 therefore also checks that the last ledger
+// entry's After* fields agree with the account.
 func TestSelfCheckDetectsAdjustedAccount(t *testing.T) {
 	f := newFixture(t, twoLevelRules())
 	f.healthy()
@@ -128,7 +131,8 @@ func TestSelfCheckDetectsAdjustedAccount(t *testing.T) {
 		if _, err := tx.PutAccount(ctx, acct); err != nil {
 			return err
 		}
-		// 追加一条「补齐差额」的流水，让「流水和 == 账户」重新成立。
+		// Append a "make up the difference" ledger entry so that
+		// "ledger sum == account" holds again.
 		_, err = tx.AppendLedger(ctx, distledger.LedgerEntry{
 			Key:              key,
 			BizType:          distledger.LedgerManualAdjust,
@@ -145,8 +149,10 @@ func TestSelfCheckDetectsAdjustedAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 这条数据在会计上「自洽」，I1 应当通过——这正是它诚实的地方：
-	// 库不能分辨这是合法的人工调整还是篡改，它能保证的是等式成立。
+	// This data is self-consistent in accounting terms, so I1 should pass—and
+	// that is exactly where I1 is honest: the library cannot tell a legitimate
+	// manual adjustment from tampering, and all it can guarantee is that the
+	// equation holds.
 	rep := f.selfCheck()
 	if !rep.OK {
 		t.Fatalf("a self-consistent manual adjustment should pass: %+v", rep.Invariants)
@@ -180,11 +186,12 @@ func TestSelfCheckDetectsDanglingCommissionReference(t *testing.T) {
 	}
 }
 
-// TestSelfCheckDetectsCapViolation 直接注入一条超配额佣金。
+// TestSelfCheckDetectsCapViolation injects a commission that exceeds the cap.
 //
-// 走公开 API 是造不出这种数据的（Rules 校验 + 运行期封顶会拦住），
-// 因此这里绕过引擎直接写存储——这正是自检存在的意义：
-// 它面向的是「数据已经坏了」的场景，而不是「代码写错了」的场景。
+// The public API cannot produce such data (Rules validation plus the runtime
+// cap would both block it), so this bypasses the engine and writes straight to
+// the store—which is precisely why self check exists: it targets the "the data
+// is already corrupt" situation, not the "the code was written wrong" one.
 func TestSelfCheckDetectsCapViolation(t *testing.T) {
 	f := newFixture(t, distledger.Rules{Levels: 1, RateBP: []distledger.Rate{1000}})
 	ctx := context.Background()
@@ -195,9 +202,9 @@ func TestSelfCheckDetectsCapViolation(t *testing.T) {
 			IdemKey:     "injected",
 			AgentUserID: 3001,
 			Layer:       1,
-			BaseAmount:  10000, // 100.00 基数
+			BaseAmount:  10000, // 100.00 base
 			Rate:        10000,
-			Amount:      999999, // 远超配额
+			Amount:      999999, // far above the cap
 			State:       distledger.CommissionPending,
 			AccruedAt:   f.clock.Now(),
 		})
@@ -248,7 +255,8 @@ func hasViolation(rep distledger.Report, prefix string) bool {
 	return false
 }
 
-// TestMoneyStringRoundTripInReport 顺带验证报告里出现的金额是可读的。
+// TestMoneyStringRoundTripInReport also verifies that the amounts appearing in
+// reports are human-readable.
 func TestMoneyStringRoundTripInReport(t *testing.T) {
 	m, err := distledger.ParseMoney("199.99")
 	if err != nil {

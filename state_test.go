@@ -5,11 +5,12 @@ import (
 	"testing"
 )
 
-// TestCommissionTransitionMatrix 穷举全部 6×6 组合。
+// TestCommissionTransitionMatrix exercises all 6x6 combinations.
 //
-// 期望值在测试里**独立重述了一遍**，而不是引用被测的那张表：
-// 如果实现里的迁移表被误改，而测试直接引用它，测试会跟着一起改对，
-// 这种「同源验证」等于没有验证。
+// The expectations are **restated independently** here rather than read from
+// the table under test: if that table were edited by mistake, a test that read
+// it would agree with the mistake, and verification against the same source
+// verifies nothing.
 func TestCommissionTransitionMatrix(t *testing.T) {
 	want := map[CommissionState]map[CommissionState]bool{
 		CommissionPending: {
@@ -25,6 +26,11 @@ func TestCommissionTransitionMatrix(t *testing.T) {
 		CommissionFrozen: {
 			CommissionPending: true,
 			CommissionVoid:    true,
+			// A refunded order must be able to claw back a risk-frozen
+			// commission: its money is still sitting in the frozen bucket, and
+			// without this edge the funds would be stranded in a state that is
+			// neither payable nor recoverable.
+			CommissionReversed: true,
 		},
 		CommissionWithdrawn: {},
 		CommissionReversed:  {},
@@ -48,9 +54,9 @@ func TestCommissionTransitionMatrix(t *testing.T) {
 	}
 }
 
-// TestSelfTransitionAlwaysRejected 单独强调一条容易被忽略的规则：
-// 状态推进必须是真实推进。若允许 Pending → Pending 成立，
-// 重复投递就可能被当成一次成功的状态迁移而重复记账。
+// TestSelfTransitionAlwaysRejected calls out one easily overlooked rule:
+// a state advance must be a real advance. If Pending → Pending were legal,
+// a duplicate delivery could pass as a successful transition and post twice.
 func TestSelfTransitionAlwaysRejected(t *testing.T) {
 	for _, s := range AllCommissionStates() {
 		if CanTransitionCommission(s, s) {
@@ -102,7 +108,8 @@ func TestValidateCommissionTransitionError(t *testing.T) {
 	}
 }
 
-// TestAllCommissionStatesReturnsCopy 防止调用方通过修改返回值破坏状态机。
+// TestAllCommissionStatesReturnsCopy stops a caller from corrupting the state
+// machine by mutating the returned slice.
 func TestAllCommissionStatesReturnsCopy(t *testing.T) {
 	a := AllCommissionStates()
 	a[0] = CommissionState(200)

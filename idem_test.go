@@ -36,10 +36,12 @@ func TestAccrueIdemKeyVariesWithEveryField(t *testing.T) {
 	}
 }
 
-// TestIdemKeyIsNotAmbiguous 验证长度前缀编码确实消除了拼接歧义。
+// TestIdemKeyIsNotAmbiguous confirms that the length-prefixed encoding really
+// removes concatenation ambiguity.
 //
-// 如果实现改成用固定分隔符拼接，("a|b", "") 与 ("a", "b") 会撞成同一个键，
-// 攻击者就能借此构造碰撞，让真实佣金被静默丢弃。
+// If the implementation switched to joining the fields with a fixed delimiter,
+// ("a|b", "") and ("a", "b") would collide into the same key, and an attacker
+// could use that collision to make genuine commissions vanish silently.
 func TestIdemKeyIsNotAmbiguous(t *testing.T) {
 	order := OrderKey{TenantID: 0, OrderID: "ORD"}
 	pairs := [][2]string{
@@ -59,10 +61,13 @@ func TestIdemKeyIsNotAmbiguous(t *testing.T) {
 	}
 }
 
-// TestOverrideProducesDistinctKeyPerCommission 覆盖一个真实缺陷的回归测试。
+// TestOverrideProducesDistinctKeyPerCommission is a regression test for a real
+// defect.
 //
-// 早期实现把调用方提供的幂等键直接当作最终键使用，导致一笔订单的
-// 第 2 条佣金起全部被判为重复而静默丢弃——钱少了，而且没有任何报错。
+// An early implementation used the caller-supplied idempotency key directly as
+// the final key, so from the second commission of an order onwards every one
+// was judged a duplicate and dropped silently — money went missing with no
+// error reported at all.
 func TestOverrideProducesDistinctKeyPerCommission(t *testing.T) {
 	order := OrderKey{TenantID: 0, OrderID: "ORD-1"}
 	override := "my-retry-key"
@@ -81,13 +86,13 @@ func TestOverrideProducesDistinctKeyPerCommission(t *testing.T) {
 		t.Fatalf("expected 6 distinct keys, got %d", len(keys))
 	}
 
-	// 同一个 override 在同一租户下必须稳定。
+	// The same override must be stable under the same tenant.
 	a := accrueIdemKey(order, "SKU-1", 1001, 1, override)
 	b := accrueIdemKey(order, "SKU-1", 1001, 1, override)
 	if a != b {
 		t.Fatal("override-derived key is not deterministic")
 	}
-	// 但不同租户必须得到不同的键，否则跨租户可能互相判重。
+	// Different tenants must get different keys, or they could dedup each other.
 	c := accrueIdemKey(OrderKey{TenantID: 9, OrderID: "ORD-1"}, "SKU-1", 1001, 1, override)
 	if a == c {
 		t.Fatal("override-derived key must include the tenant")

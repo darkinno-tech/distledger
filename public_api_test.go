@@ -10,10 +10,11 @@ import (
 	"github.com/im10furry/distledger/store/memory"
 )
 
-// 本文件使用**外部测试包**（package distledger_test）。
+// This file uses an **external test package** (package distledger_test).
 //
-// 这有两个好处：一是验证公开 API 真的够用（不需要任何未导出符号），
-// 二是避免 distledger_test → store/memory → distledger 的导入环。
+// That buys two things: it proves the public API is genuinely sufficient (no
+// unexported symbols needed), and it avoids the import cycle
+// distledger_test → store/memory → distledger.
 
 const tenant = int64(0)
 
@@ -92,7 +93,7 @@ func (f *fixture) balance(userID int64) distledger.Account {
 	return bal
 }
 
-// ── 分佣 ────────────────────────────────────────────────────────────────
+// ── Commission accrual ────────────────────────────────────────────────
 
 func TestAccrueMultiLevel(t *testing.T) {
 	f := newFixture(t, distledger.Rules{
@@ -130,7 +131,7 @@ func TestAccrueMultiLevel(t *testing.T) {
 		}
 	}
 
-	// 资金进入「待结算」而非「可提现」。
+	// The money lands in the frozen bucket, not the available one.
 	for userID, amount := range want {
 		bal := f.balance(userID)
 		if bal.Frozen != amount {
@@ -144,7 +145,7 @@ func TestAccrueMultiLevel(t *testing.T) {
 		}
 	}
 
-	// 分佣总额不得超过基数。
+	// The total allocated commission must never exceed the base.
 	var total distledger.Money
 	for _, c := range res.Commissions {
 		total += c.Amount
@@ -198,10 +199,11 @@ func TestAccrueWithoutBindingIsNotAnError(t *testing.T) {
 	}
 }
 
-// TestNoRetroactiveAttribution 是一个安全属性测试。
+// TestNoRetroactiveAttribution is a safety property test.
 //
-// 若归因只看「当前绑定」，任何人只要在订单支付后把自己绑成买家的推广人
-// 就能追认这笔收益。因此绑定必须在支付时刻就已经存在且有效。
+// If attribution looked only at the *current* binding, anyone could claim an
+// order simply by binding themselves to the buyer after payment. A binding must
+// therefore already exist and be valid at the moment of payment.
 func TestNoRetroactiveAttribution(t *testing.T) {
 	f := newFixture(t, twoLevelRules())
 	f.mustAgent(3001, 0, distledger.AgentActive)
@@ -214,11 +216,12 @@ func TestNoRetroactiveAttribution(t *testing.T) {
 		t.Fatalf("OnOrderPaid: %v", err)
 	}
 
-	// 订单支付之后才建立绑定。
+	// The binding is created only after the order has been paid.
 	f.clock.Advance(time.Hour)
 	f.mustBuyer(4001, 3001)
 
-	// 重放同一事件（沿用原支付时刻）：仍然不应归因。
+	// Replay the same event (reusing the original paid-at time): still no
+	// attribution.
 	res, err := f.led.OnOrderPaid(context.Background(), distledger.OrderPaidEvent{
 		TenantID: tenant, OrderID: "ORD-1", BuyerUserID: 4001,
 		PaidAmount: 100000, PaidAt: paidAt,
@@ -299,9 +302,10 @@ func TestAccruePerOrderItem(t *testing.T) {
 	}
 }
 
-// TestItemAmountsCannotExceedPaidAmount 覆盖一个直接的资损入口：
-// 如果明细金额之和可以大于实付金额，调用方只要塞一个虚高明细，
-// 平台就会按高于实收的基数支付佣金。
+// TestItemAmountsCannotExceedPaidAmount covers a direct money-loss entry point:
+// if line item amounts could sum to more than the paid amount, a caller could
+// slip in one inflated item and the platform would pay commission on a base
+// higher than what it actually collected.
 func TestItemAmountsCannotExceedPaidAmount(t *testing.T) {
 	f := newFixture(t, distledger.Rules{Levels: 1, RateBP: []distledger.Rate{1000}})
 	_, err := f.led.OnOrderPaid(context.Background(), distledger.OrderPaidEvent{
@@ -317,8 +321,9 @@ func TestItemAmountsCannotExceedPaidAmount(t *testing.T) {
 	}
 }
 
-// TestCapIsEnforcedUnderRoundingUp 验证配额封顶在最容易越界的配置下生效：
-// 向上取整 + 两级费率合计 100%，此时每级都会「多算出一点点」。
+// TestCapIsEnforcedUnderRoundingUp verifies that the cap holds under the setup
+// most likely to breach it: round-up plus two levels whose rates total 100%,
+// where every level rounds a little extra.
 func TestCapIsEnforcedUnderRoundingUp(t *testing.T) {
 	f := newFixture(t, distledger.Rules{
 		Levels: 2, RateBP: []distledger.Rate{5000, 5000},
@@ -328,7 +333,7 @@ func TestCapIsEnforcedUnderRoundingUp(t *testing.T) {
 	f.mustAgent(3002, 3001, distledger.AgentActive)
 	f.mustBuyer(4001, 3002)
 
-	res := f.mustPay("ORD-1", 4001, 1) // 基数为 0.01 元
+	res := f.mustPay("ORD-1", 4001, 1) // base is 0.01
 	var total distledger.Money
 	for _, c := range res.Commissions {
 		total += c.Amount
@@ -344,7 +349,7 @@ func TestIneligibleFirstLevelAgentBlocksAccrual(t *testing.T) {
 	f.mustAgent(3002, 3001, distledger.AgentActive)
 	f.mustBuyer(4001, 3002)
 
-	// 绑定之后把第 1 级分销员停用。
+	// Deactivate the level-1 agent after the binding.
 	f.mustAgent(3002, 3001, distledger.AgentInactive)
 
 	res := f.mustPay("ORD-1", 4001, 100000)
@@ -356,15 +361,16 @@ func TestIneligibleFirstLevelAgentBlocksAccrual(t *testing.T) {
 	}
 }
 
-// TestIneligibleMidChainDoesNotBreakUpline 固化一条刻意的策略：
-// 中间层级不合格只跳过该级，链条继续向上。否则一个被临时禁用的人会
-// 无声地吞掉他所有上级的收益。
+// TestIneligibleMidChainDoesNotBreakUpline pins down a deliberate policy:
+// an ineligible mid-chain level is skipped and the chain keeps walking upward.
+// Otherwise one temporarily disabled agent would silently swallow the
+// earnings of every upline above them.
 func TestIneligibleMidChainDoesNotBreakUpline(t *testing.T) {
 	f := newFixture(t, distledger.Rules{
 		Levels: 3, RateBP: []distledger.Rate{500, 200, 100},
 	})
 	f.mustAgent(3001, 0, distledger.AgentActive)
-	f.mustAgent(3002, 3001, distledger.AgentInactive) // 中间层被禁用
+	f.mustAgent(3002, 3001, distledger.AgentInactive) // mid level disabled
 	f.mustAgent(3003, 3002, distledger.AgentActive)
 	f.mustBuyer(4001, 3003)
 
@@ -384,7 +390,7 @@ func TestIneligibleMidChainDoesNotBreakUpline(t *testing.T) {
 	}
 }
 
-// ── 关系链 ──────────────────────────────────────────────────────────────
+// ── Relation chain ───────────────────────────────────────────────────
 
 func TestBindAgentRejectsCycle(t *testing.T) {
 	f := newFixture(t, distledger.Rules{Levels: 3, RateBP: []distledger.Rate{100, 100, 100}})
@@ -433,7 +439,7 @@ func TestBindAgentRejectsMissingParent(t *testing.T) {
 	}
 }
 
-// TestBindBuyerIsFirstWins 固化防抢客规则。
+// TestBindBuyerIsFirstWins pins down the anti-poaching rule.
 func TestBindBuyerIsFirstWins(t *testing.T) {
 	f := newFixture(t, distledger.Rules{Levels: 1, RateBP: []distledger.Rate{500}})
 	f.mustAgent(3001, 0, distledger.AgentActive)

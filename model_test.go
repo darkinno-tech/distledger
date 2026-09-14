@@ -8,11 +8,13 @@ import (
 	"time"
 )
 
-// 本文件覆盖纯函数与类型行为：枚举的字符串表示、校验分支、
-// 错误类型的 Error/Unwrap、规则校验的各个失败面。
+// This file covers pure functions and type behaviour: enum string
+// representations, validation branches, Error/Unwrap on the error types, and
+// every failure face of rules validation.
 //
-// 这些看起来琐碎，但它们是错误信息与日志的载体：枚举 String() 写错
-// 会让排障时看到的状态名与实际不符，而排障阶段最不能容忍误导。
+// These look trivial, but they carry error messages and logs: an enum String()
+// that names the wrong state makes the state seen while debugging disagree
+// with reality, and debugging is the worst time to be misled.
 
 func TestEnumStrings(t *testing.T) {
 	joinTypes := map[JoinType]string{JoinFree: "free", JoinReviewed: "reviewed", JoinPaid: "paid"}
@@ -212,11 +214,13 @@ func TestAccrueResultAccruedAmount(t *testing.T) {
 	res := AccrueResult{Commissions: []Commission{
 		{Amount: 100}, {Amount: 250},
 	}}
-	if got := res.AccruedAmount(); got != 350 {
-		t.Fatalf("AccruedAmount = %d, want 350", got)
+	got, err := res.AccruedAmount()
+	if err != nil || got != 350 {
+		t.Fatalf("AccruedAmount = %d, %v; want 350", got, err)
 	}
-	if got := (AccrueResult{}).AccruedAmount(); got != 0 {
-		t.Fatalf("empty result = %d, want 0", got)
+	got, err = (AccrueResult{}).AccruedAmount()
+	if err != nil || got != 0 {
+		t.Fatalf("empty result = %d, %v; want 0", got, err)
 	}
 }
 
@@ -263,8 +267,9 @@ func TestRulesNormalize(t *testing.T) {
 		t.Errorf("MaxAllocatableBP = %d, want %d", got.MaxAllocatableBP, MaxRateBP)
 	}
 
-	// 长度非零但与 Levels 不符时**不能**静默补零：
-	// 那会把「少配了一级」变成一个不会报警的「那一级不发钱」。
+	// A non-zero rate count that disagrees with Levels must **not** be padded
+	// with zeros silently: that would turn "one level was left unconfigured"
+	// into "that level pays nothing", which raises no alarm at all.
 	bad := Rules{Levels: 3, RateBP: []Rate{500}}.Normalize()
 	if err := bad.Validate(); err == nil {
 		t.Fatal("mismatched rate count must still fail validation after Normalize")
@@ -326,11 +331,11 @@ func TestDefaultRateResolver(t *testing.T) {
 
 func TestDefaultEligibility(t *testing.T) {
 	e := defaultEligibility{}
-	if ok, _ := e.Eligible(context.Background(), Agent{Status: AgentActive}, OrderKey{}); !ok {
+	if ok, _ := e.Eligible(context.Background(), EligibilityInput{Agent: Agent{Status: AgentActive}}); !ok {
 		t.Error("active agent must be eligible")
 	}
 	for _, s := range []AgentStatus{AgentInactive, AgentDisabled} {
-		ok, reason := e.Eligible(context.Background(), Agent{Status: s}, OrderKey{})
+		ok, reason := e.Eligible(context.Background(), EligibilityInput{Agent: Agent{Status: s}})
 		if ok {
 			t.Errorf("%s agent must not be eligible", s)
 		}
@@ -382,7 +387,7 @@ func TestOrderPaidEventValidation(t *testing.T) {
 		})
 	}
 
-	// 明细之和恰好等于实付金额是合法的。
+	// Items summing to exactly the paid amount are legal.
 	edge := valid
 	edge.PaidAmount = 100
 	edge.Items = []OrderItem{{ItemID: "a", Amount: 40}, {ItemID: "b", Amount: 60}}
@@ -512,8 +517,8 @@ func TestManualClock(t *testing.T) {
 	}
 }
 
-// TestIdemKeyLengthsAreBounded 确认长度上限真的在 validate 里生效，
-// 而不是只写在常量注释里。
+// TestIdemKeyLengthsAreBounded confirms the length ceiling is really enforced
+// in validate, rather than merely written down in a comment on the constant.
 func TestIdemKeyLengthsAreBounded(t *testing.T) {
 	ev := OrderPaidEvent{
 		TenantID: 0, OrderID: "ORD-1", BuyerUserID: 1,

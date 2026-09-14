@@ -4,46 +4,60 @@ import (
 	"time"
 )
 
-// 本文件定义库与外部系统之间的**事件契约**。
+// This file defines the **event contract** between the library and external
+// systems.
 //
-// 刻意的设计选择（见 ADR-012）：
-//   - 全部是普通 Go struct，不用 protobuf、不用 codegen、不用反射注册。
-//   - 每个事件都是**幂等**的：重复投递不会产生第二笔账。接入方可以把它
-//     直接挂在 at-least-once 的消息队列上，不需要自己设计去重。
-//   - 事件里没有任何「库需要回调你」的字段：库不接管接入方的生命周期。
+// Deliberate design choices (see ADR-012):
+//   - Everything is a plain Go struct: no protobuf, no codegen, no reflection
+//     registry.
+//   - Every event is **idempotent**: a duplicate delivery never books a second
+//     entry. A caller can attach it straight to an at-least-once message queue
+//     without designing its own deduplication.
+//   - No event carries any "the library needs to call you back" field: the
+//     library never takes over the caller's lifecycle.
 
-// OrderItem 是一笔订单中的一个明细行。
+// OrderItem is one line item within an order.
 //
-// 只有在需要按 SKU 分别计算佣金时才需要提供 Items；不提供时按订单整体计佣。
+// Items only need to be supplied when commission has to be computed per SKU;
+// without them the whole order is commissioned as a single unit.
 type OrderItem struct {
-	// ItemID 是明细行标识，在同一订单内必须唯一。
+	// ItemID is the line item identifier, unique within the order.
 	ItemID string
-	// Amount 是该明细行参与计佣的金额（已扣该行分摊的优惠与运费）。
+	// Amount is the amount of this line that joins the commission base (the
+	// line's share of discounts and shipping already deducted).
 	Amount Money
 }
 
-// OrderPaidEvent 表示一笔订单已支付成功。
+// OrderPaidEvent means an order was paid successfully.
 //
-// 这是分佣的触发点。库会在收到本事件时完成：归因 → 计算各级佣金 → 入账到
-// 「待结算」桶 → 写资金流水。整个过程在**一个事务**内完成。
+// This is the trigger for commission. On receiving the event the library
+// performs: attribution → per-level commission computation → accrual into the
+// "pending settlement" bucket → ledger write. The whole thing happens inside
+// **one transaction**.
 type OrderPaidEvent struct {
 	TenantID    int64
 	OrderID     string
 	BuyerUserID int64
-	// PaidAmount 是实付金额（已扣运费与平台承担券），也是分佣的总额上限。
+	// PaidAmount is the amount actually paid (shipping and platform-funded
+	// coupons deducted); it is also the total cap on commission.
 	PaidAmount Money
-	// Items 可选。提供后按明细分别计佣；不提供则按订单整体计佣。
+	// Items is optional. When supplied, commission is computed per line item;
+	// when omitted, the order is commissioned as a whole.
 	Items []OrderItem
-	// PaidAt 是支付时间，**必填**，用于判定绑定关系在支付时刻是否已经存在
-	// 且有效。
+	// PaidAt is the payment time and is **required**; it decides whether the
+	// binding existed and was effective at the moment of payment.
 	//
-	// 它是必填而不是「留空取当前时间」，这是一个安全要求：如果用当前时间
-	// 代替，那么一次发生在绑定建立之前的重放（首次投递时没有绑定、之后
-	// 有人补上绑定再重放）就会被追认为有效归因——相当于给「事后抢单」
-	// 留了一道门。宁可要求调用方多传一个字段。
+	// It is required rather than "leave it empty and take the current time",
+	// and that is a safety requirement: substituting the current time would let
+	// a replay that happened before the binding existed (no binding on the
+	// first delivery, someone adds one later and replays) be retroactively
+	// accepted as valid attribution — which is to say, it would leave a door
+	// open for "grabbing the order after the fact". Better to ask the caller
+	// for one extra field.
 	PaidAt time.Time
-	// IdemKey 可选。留空时由库派生；提供时会被映射到独立命名空间，
-	// 无法冒充库派生的键（见 idem.go）。
+	// IdemKey is optional. When empty the library derives one; when supplied it
+	// is mapped into a separate namespace, so it cannot impersonate a
+	// library-derived key (see idem.go).
 	IdemKey string
 }
 
@@ -74,6 +88,10 @@ func (e OrderPaidEvent) validate() error {
 			"must be set; the library refuses to substitute the current time "+
 				"because that would let a binding created after payment capture the order")
 	}
+	if len(e.Items) > MaxOrderItems {
+		return fieldErrf("items", "must contain at most %d entries, got %d", MaxOrderItems, len(e.Items))
+	}
+
 	seen := make(map[string]struct{}, len(e.Items))
 	var sum Money
 	for i, it := range e.Items {
@@ -84,8 +102,12 @@ func (e OrderPaidEvent) validate() error {
 		if len(it.ItemID) > MaxOrderItemIDLen {
 			return fieldErrf(field, "must be at most %d bytes, got %d", MaxOrderItemIDLen, len(it.ItemID))
 		}
-		if it.Amount < 0 {
-			return fieldErrf("items["+i64s(int64(i))+"].amount", "must be >= 0, got %s", it.Amount)
+		if it.Amount <= 0 {
+			// A zero-amount line cannot produce a commission, so it signals a
+			// mapping bug far more often than a real gift item. Rejecting it
+			// turns a silent no-op into a loud error, and it also removes the
+			// cheapest way to make the engine do unbounded work.
+			return fieldErrf("items["+i64s(int64(i))+"].amount", "must be > 0, got %s", it.Amount)
 		}
 		if _, dup := seen[it.ItemID]; dup {
 			return fieldErrf(field, "duplicate item id %q", it.ItemID)
@@ -97,10 +119,13 @@ func (e OrderPaidEvent) validate() error {
 		}
 		sum = next
 	}
-	// 关键的安全校验：明细金额之和不得超过实付金额。
+	// The critical safety check: the sum of the item amounts must not exceed
+	// the paid amount.
 	//
-	// 否则调用方（或伪造事件的攻击者）只要塞入一个金额虚高的明细，
-	// 就能让平台按高于实收的基数支付佣金——这是直接的资损入口。
+	// Otherwise a caller (or an attacker forging events) only has to slip in
+	// one line with an inflated amount to make the platform pay commission on a
+	// base larger than what it actually received — a direct money-loss entry
+	// point.
 	if sum > e.PaidAmount {
 		return fieldErrf("items",
 			"sum of item amounts (%s) exceeds paid amount (%s)", sum, e.PaidAmount)
@@ -108,13 +133,15 @@ func (e OrderPaidEvent) validate() error {
 	return nil
 }
 
-// OrderReceivedEvent 表示买家已确认收货。
+// OrderReceivedEvent means the buyer confirmed receipt.
 //
-// 它把待结算佣金推进到「冻结期开始计时」的状态：
-// AvailableAt = ReceivedAt + 入账时快照的 FreezeDays。
+// It advances pending commissions to the state where the freeze window starts
+// counting: AvailableAt = ReceivedAt + the FreezeDays snapshotted at accrual
+// time.
 //
-// 本事件是幂等的，且**先到先得**：同一次收货重复投递不会改变已确定的
-// AvailableAt，避免有人用重复投递把到账时间往前刷。
+// This event is idempotent and **first writer wins**: a duplicate delivery of
+// the same receipt never changes an AvailableAt that is already determined,
+// which stops anyone from pushing the payout time earlier by replaying.
 type OrderReceivedEvent struct {
 	TenantID   int64
 	OrderID    string
@@ -129,26 +156,47 @@ func (e OrderReceivedEvent) validate() error {
 	return e.orderKey().Validate()
 }
 
-// SkipCode 说明某一层级为什么没有产生佣金。
+// MaxOrderItems is the maximum number of line items one order may carry.
 //
-// 它存在的意义是「可解释性」：接入方排查「为什么我的分销员没拿到钱」时，
-// 必须能从返回值里直接看到原因，而不是去猜（见 PRD 铁律 R6）。
+// It exists not because "business should never have more", but because **work
+// must be predictable**: commission runs inside a transaction that holds the
+// global write lock, so a single request carrying a hundred thousand line
+// items would stall the accounting of every tenant for tens of milliseconds. A
+// bound is what buys a predictable tail latency.
+const MaxOrderItems = 200
+
+// SkipCode explains why one level produced no commission.
+//
+// Its reason to exist is explainability: when a caller investigates "why did my
+// agent not get paid", the answer must be directly visible in the return value
+// rather than guessed (see PRD iron rule R6).
 type SkipCode uint8
 
 const (
-	// SkipZeroAmount 表示按费率算出的佣金为 0（通常是费率未配置）。
+	// SkipZeroAmount means the commission computed from the rate is 0 (usually
+	// the rate is not configured).
 	SkipZeroAmount SkipCode = iota + 1
-	// SkipIneligible 表示该分销员不具备获得佣金的资格（未激活/被禁用）。
+	// SkipIneligible means the agent is not eligible for commission (not
+	// active / disabled).
 	SkipIneligible
-	// SkipNoParent 表示关系链在此处断开，没有更上一级了。
+	// SkipNoParent means the relation chain breaks here; there is no higher
+	// level.
 	SkipNoParent
-	// SkipCapExhausted 表示订单可分佣总额已用尽。
+	// SkipCapExhausted means the order's total commissionable amount is used
+	// up.
 	SkipCapExhausted
-	// SkipAgentMissing 表示关系链中引用的上级分销员不存在。
+	// SkipAgentMissing means an upline agent referenced by the relation chain
+	// does not exist.
 	SkipAgentMissing
+	// SkipFullyReversed means the reversible balance of this commission is
+	// already zero.
+	SkipFullyReversed
+	// SkipAlreadyWithdrawn means the commission has already been paid out and
+	// clawing it back needs a debt policy.
+	SkipAlreadyWithdrawn
 )
 
-// String 返回跳过原因的稳定标识。
+// String returns the stable identifier of the skip reason.
 func (c SkipCode) String() string {
 	switch c {
 	case SkipZeroAmount:
@@ -161,86 +209,239 @@ func (c SkipCode) String() string {
 		return "cap_exhausted"
 	case SkipAgentMissing:
 		return "agent_missing"
+	case SkipFullyReversed:
+		return "fully_reversed"
+	case SkipAlreadyWithdrawn:
+		return "already_withdrawn"
 	default:
 		return "unknown"
 	}
 }
 
-// SkipReason 记录某一层级被跳过的具体原因。
+// SkipReason records the concrete reason one level was skipped.
 type SkipReason struct {
-	// Layer 从 1 开始。
+	// Layer starts at 1.
 	Layer       int
 	AgentUserID int64
 	Code        SkipCode
 	Detail      string
 }
 
-// AccrueResult 是 OnOrderPaid 的结果。
+// AccrueResult is the result of OnOrderPaid.
 type AccrueResult struct {
 	OrderKey OrderKey
-	// Attributed 报告是否找到了有效的归因对象。
+	// Attributed reports whether a valid attribution target was found.
 	//
-	// 为 false 时**不是错误**：没有推广归属的订单只是不分佣，
-	// 不应该让订单系统收到一个失败（见 PRD 兜底设计）。
+	// false is **not an error**: an order with no referral attribution simply
+	// earns no commission, and the order system should not be handed a failure
+	// (see the PRD fallback design).
 	Attributed bool
-	// AgentUserID 是订单归属的分销员；未归因时为 0。
+	// AgentUserID is the agent the order is attributed to; 0 when unattributed.
 	AgentUserID int64
-	// Commissions 是本次**新产生**的佣金。重复投递时为空。
+	// Commissions are the commissions **newly created** by this call. Empty on
+	// a duplicate delivery.
 	Commissions []Commission
-	// Replayed 报告本次调用是否命中了幂等重放（即此前已入账）。
+	// Replayed reports whether this call hit an idempotent replay (that is, it
+	// was accrued before).
 	Replayed bool
-	// Skipped 解释各级为什么没有产生佣金。
+	// Skipped explains why each level produced no commission.
 	Skipped []SkipReason
 }
 
-// AccruedAmount 返回本次新产生佣金的合计。
-func (r AccrueResult) AccruedAmount() Money {
+// AccruedAmount returns the total of the commissions newly created by this
+// call.
+//
+// It returns an error instead of silently wrapping: the most common use of this
+// function is writing to a log or a reconciliation report, and a total that
+// quietly overflowed into a negative number would send the investigation in a
+// completely wrong direction.
+func (r AccrueResult) AccruedAmount() (Money, error) {
 	var sum Money
+	var err error
 	for _, c := range r.Commissions {
-		sum += c.Amount
+		if sum, err = sum.Add(c.Amount); err != nil {
+			return 0, err
+		}
 	}
-	return sum
+	return sum, nil
 }
 
-// ReceiveResult 是 OnOrderReceived 的结果。
+// ReceiveResult is the result of OnOrderReceived.
 type ReceiveResult struct {
 	OrderKey OrderKey
-	// Updated 是被本次调用首次确定到账时间的佣金笔数。重复投递时为 0。
+	// Updated is the number of commissions whose payout time this call
+	// determined for the first time. 0 on a duplicate delivery.
 	Updated int
 }
 
-// MaintainResult 是 Maintain 的结果。
+// MaintainResult is the result of Maintain.
 type MaintainResult struct {
-	// SettledCount 是被结算的佣金笔数。
+	// SettledCount is the number of commissions settled.
 	SettledCount int
-	// SettledAmount 是结算金额合计。
+	// SettledAmount is the total amount settled.
 	SettledAmount Money
+	// Quarantined holds the IDs of commissions quarantined during this
+	// heartbeat because of anomalous data.
+	//
+	// Quarantining rather than failing bounds the blast radius: one bad record
+	// must not bring every agent's withdrawals to a halt. Quarantined records
+	// are also logged and flagged by SelfCheck as invariant violations, so they
+	// never disappear quietly.
+	Quarantined []int64
 }
 
-// BindAgentRequest 是登记一个分销员的请求。
+// RefundItem describes how much one line item returned in this refund.
+type RefundItem struct {
+	// ItemID must match the ItemID supplied in OrderPaidEvent.Items.
+	ItemID string
+	// Amount is the amount refunded for this line item in this refund.
+	Amount Money
+}
+
+// OrderRefundedEvent means a refund happened on an order.
+//
+// It is **idempotent** and may be delivered in any order, any number of times,
+// in instalments: the engine computes "how much should have been reversed in
+// total", not "how much to deduct this time".
+//
+// Exactly **one** of three representations must be supplied:
+//
+//	IsFull  —— full order refund, reverses every computation unit to its cap
+//	Items   —— per line item refund, ItemID must match accrual time
+//	Amount  —— order-level refund amount, split automatically by each unit's
+//	           share of the commission base
+type OrderRefundedEvent struct {
+	TenantID int64
+	OrderID  string
+	// IsFull true means Items and Amount are ignored.
+	IsFull bool
+	// Items is the line item list used for a per-item refund.
+	Items []RefundItem
+	// Amount is the order-level refund amount when line items are not
+	// distinguished.
+	Amount Money
+	// RefundedAt is when the refund happened and is **required**.
+	//
+	// It is required for the same reason as PaidAt: a reversal record is an
+	// audit voucher, and the time on a voucher must come from the business
+	// system, not from the accounting library's current instant.
+	RefundedAt time.Time
+	// IdemKey identifies this refund in the caller's system and is **required**.
+	//
+	// It belongs to the same class of agreement as PaidAt: the library needs a
+	// fact from the business system to guarantee idempotency rather than
+	// guessing. Without it, one redelivery and two genuine refunds of the same
+	// amount are completely equivalent in the data, and any implementation can
+	// only get it wrong by picking one of the two.
+	//
+	// In practice this is the refund number returned by the payment channel, or
+	// the caller's own refund transaction number.
+	IdemKey string
+}
+
+func (e OrderRefundedEvent) orderKey() OrderKey {
+	return OrderKey{TenantID: e.TenantID, OrderID: e.OrderID}
+}
+
+func (e OrderRefundedEvent) validate() error {
+	if err := e.orderKey().Validate(); err != nil {
+		return err
+	}
+	if e.RefundedAt.IsZero() {
+		return fieldErr("refunded_at", "must be set; an audit record needs the caller's event time")
+	}
+	if e.IdemKey == "" {
+		return fieldErr("idem_key",
+			"must be set to the caller's refund identifier; without it a retry and "+
+				"a second refund of the same amount are indistinguishable")
+	}
+	if err := validateIdemKeyOverride(e.IdemKey); err != nil {
+		return err
+	}
+
+	modes := 0
+	if e.IsFull {
+		modes++
+	}
+	if len(e.Items) > 0 {
+		modes++
+	}
+	if e.Amount > 0 {
+		modes++
+	}
+	switch {
+	case modes == 0:
+		return fieldErr("is_full", "exactly one of is_full, items or amount must be provided")
+	case modes > 1:
+		return fieldErr("is_full", "is_full, items and amount are mutually exclusive")
+	}
+
+	if e.Amount < 0 {
+		return fieldErrf("amount", "must be >= 0, got %s", e.Amount)
+	}
+
+	seen := make(map[string]struct{}, len(e.Items))
+	for i, it := range e.Items {
+		field := "items[" + i64s(int64(i)) + "].item_id"
+		if len(it.ItemID) > MaxOrderItemIDLen {
+			return fieldErrf(field, "must be at most %d bytes, got %d", MaxOrderItemIDLen, len(it.ItemID))
+		}
+		if it.Amount <= 0 {
+			return fieldErrf("items["+i64s(int64(i))+"]..amount", "must be > 0, got %s", it.Amount)
+		}
+		if _, dup := seen[it.ItemID]; dup {
+			return fieldErrf(field, "duplicate item id %q", it.ItemID)
+		}
+		seen[it.ItemID] = struct{}{}
+	}
+	return nil
+}
+
+// RefundResult is the result of OnOrderRefunded.
+type RefundResult struct {
+	OrderKey OrderKey
+	// Reversed are the reversal records **newly created** by this call
+	// (negative Amount).
+	Reversed []Commission
+	// ReversedAmount is the total amount reversed by this call (positive).
+	ReversedAmount Money
+	// AlreadyReversed reports that this call left no new reversal behind.
+	//
+	// When it is true and err is nil, the meaning is "the reversal this refund
+	// needed was already done" — a duplicate delivery, or the refund is already
+	// refunded down to the floor.
+	AlreadyReversed bool
+	// Skipped explains which commissions were not reversed, and why.
+	Skipped []SkipReason
+}
+
+// BindAgentRequest is a request to register one agent.
 type BindAgentRequest struct {
 	TenantID int64
 	UserID   int64
-	// ParentID 是直接上级的用户 ID；0 表示顶级分销员。
+	// ParentID is the user ID of the direct upline; 0 means a top-level agent.
 	ParentID int64
 	JoinType JoinType
-	// Status 留空（零值）时按 AgentInactive 处理，需要显式激活。
-	// 接入方若采用「无门槛」模式，可传 AgentActive。
+	// Status, when left empty (the zero value), is treated as AgentInactive
+	// and must be activated explicitly. A caller using a "no entry requirement"
+	// mode may pass AgentActive.
 	Status AgentStatus
-	// RateOverrideBP 可选，覆盖全局费率。
+	// RateOverrideBP is optional and overrides the global rate.
 	RateOverrideBP *Rate
-	// Idempotent 为 true 时，重复登记同一个 (UserID, ParentID) 不报错。
-	// 默认（false）行为同样是幂等的，此字段保留给未来的严格模式。
+	// Idempotent true means registering the same (UserID, ParentID) twice does
+	// not error. The default false behaviour is also idempotent; this field is
+	// reserved for a future strict mode.
 	Idempotent bool
 }
 
-// BindBuyerRequest 是建立「买家 → 分销员」归因关系的请求。
+// BindBuyerRequest is a request to create a "buyer → agent" attribution
+// relation.
 type BindBuyerRequest struct {
 	TenantID    int64
 	BuyerUserID int64
 	AgentUserID int64
 	Source      BindSource
 	SourceRef   string
-	// BoundAt 为零值时取 Clock 当前时间。
+	// BoundAt, when zero, means the Clock's current time is used.
 	BoundAt time.Time
 }

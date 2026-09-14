@@ -1,27 +1,34 @@
-// Package memory 提供 distledger 的内存 Store 实现。
+// Package memory provides the in-memory implementation of distledger.Store.
 //
-// 它的定位是**参考实现与轻量部署**：单元测试、演示、单进程小规模部署。
-// 生产环境请使用 store/mysql（具备真正的行锁与索引）。
+// It targets the reference and small-deployment use cases: unit tests, demos,
+// and single-process installations. Production deployments should use
+// store/mysql, which has real row locks and indexes.
 //
-// # 一致性模型
+// # Consistency model
 //
-//   - Update 持有全局写锁，事务之间完全串行，等价于可串行化隔离级别。
-//   - View 持有读锁，不会读到未提交的数据（写锁与读锁互斥）。
-//   - 事务失败时通过**撤销日志**回滚。回滚代价与「本次事务触碰的对象数量」
-//     成正比，而不是与数据总量成正比。
+//   - Update holds a global write lock, so transactions are fully serialised.
+//     The effective isolation level is serialisable.
+//   - View holds a read lock and never sees uncommitted writes, because the
+//     read and write locks are mutually exclusive.
+//   - A failed transaction is undone through an undo log. The cost of a
+//     rollback is proportional to the number of objects the transaction
+//     touched, not to the size of the data set.
 //
-// # 回滚为什么会写这么细
+// # Why the rollback machinery is this detailed
 //
-// 大多数写操作都是 map upsert 或切片追加，回滚只需「还原旧值」或
-// 「截断到原长度」。唯独到期索引 pendingDue 需要在中间插入和删除，
-// 这两种操作会让「截断到原长度」恢复出错误的内容（元素被搬移过）。
-// 因此本文件对切片采用**混合快照**：
+// Most writes are map upserts or tail appends, which undo by restoring the old
+// value or truncating to the old length. Two cases are not that simple:
 //
-//   - 尾部追加：只记录原长度（廉价）。
-//   - 中间插入/删除：升级为全量克隆（昂贵但罕见，且必须正确）。
+//  1. Ordered indexes (settlement due times, account keys) are inserted into
+//     and deleted from the middle, which shifts elements. Truncating to the old
+//     length there would restore misaligned content.
+//  2. Truncating an append-only slice index to zero leaves an empty slice under
+//     the key, so a stream of failed transactions would grow the index map
+//     without bound.
 //
-// 这是刻意为之：宁可在一个罕见路径上多拷一份索引，也不接受一个
-// 「回滚后数据看起来正常、实际错位」的隐蔽缺陷。
+// Hence two undo primitives: append-only indexes record "did the key exist" plus
+// the old length, and ordered indexes use a hybrid snapshot - a length for tail
+// appends, escalating to a full clone for middle inserts and deletes.
 package memory
 
 import (
@@ -34,42 +41,68 @@ import (
 	"github.com/im10furry/distledger"
 )
 
-// idemRef 是幂等键的复合主键。
+// idemRef is the composite key of the idempotency index.
 type idemRef struct {
 	tenantID int64
 	key      string
 }
 
-// dueRef 是到期索引中的一项。
+// dueRef is one entry of the settlement index.
+//
+// The tenant id is part of the sort key so that a per-tenant query is answered
+// by two binary searches instead of a scan over every due entry in the
+// installation. Without it, one busy tenant would make every other tenant's
+// Maintain call linear in the global backlog, quietly contradicting the
+// O(log n + limit) contract the port advertises.
 type dueRef struct {
-	at time.Time
-	id int64
+	tenantID int64
+	at       time.Time
+	id       int64
 }
 
-// data 是全部状态。所有字段仅在持有 Store.mu 时访问。
+func (r dueRef) less(o dueRef) bool {
+	if r.tenantID != o.tenantID {
+		return r.tenantID < o.tenantID
+	}
+	if !r.at.Equal(o.at) {
+		return r.at.Before(o.at)
+	}
+	return r.id < o.id
+}
+
+// data holds all state. Every field is accessed only while holding Store.mu.
 type data struct {
 	agents   map[distledger.UserKey]distledger.Agent
 	bindings map[distledger.UserKey]distledger.Binding
 	accounts map[distledger.UserKey]distledger.Account
 
 	commissions map[int64]distledger.Commission
-	// commissionIDs 按 ID 升序保存全部佣金 ID，用于键集分页。
-	// 它是纯追加索引（ID 单调递增），因此回滚只需记录长度。
+	// commissionIDs is an append-only ascending index over commissions.
 	commissionIDs []int64
 	idem          map[idemRef]int64
 	byOrder       map[distledger.OrderKey][]int64
 	byAgent       map[distledger.UserKey][]int64
+
+	refunds        map[int64]distledger.Refund
+	refundIdem     map[idemRef]int64
+	refundsByOrder map[distledger.OrderKey][]int64
 
 	ledger         map[int64]distledger.LedgerEntry
 	ledgerIDs      []int64
 	ledgerByUser   map[distledger.UserKey][]int64
 	ledgerByTenant map[int64][]int64
 
-	// pendingDue 按 (at, id) 升序保存「已确定到账时间」的佣金 ID。
+	// accountIDs is an ordered index over accounts, sorted by (tenant, user).
 	//
-	// 它是查询加速用的派生索引：即使内容与真实状态不一致也不会算错钱
-	// （读取时校验新鲜度并跳过失效项），只是会多做几次无用的扫描。
-	// 正因为它不是事实来源，删除与插入都可以放心地在这里做。
+	// It exists so keyset pagination does not re-sort every account on every
+	// page, which turned reconciliation into an O(n^2) walk.
+	accountIDs []distledger.UserKey
+
+	// pendingDue holds commission ids whose settlement time is known, sorted by
+	// (tenant, at, id).
+	//
+	// It is a derived index: readers validate freshness and skip stale entries,
+	// so drift costs extra scanning but can never produce a wrong number.
 	pendingDue []dueRef
 
 	nextID int64
@@ -84,28 +117,33 @@ func newData() *data {
 		idem:           make(map[idemRef]int64),
 		byOrder:        make(map[distledger.OrderKey][]int64),
 		byAgent:        make(map[distledger.UserKey][]int64),
+		refunds:        make(map[int64]distledger.Refund),
+		refundIdem:     make(map[idemRef]int64),
+		refundsByOrder: make(map[distledger.OrderKey][]int64),
 		ledger:         make(map[int64]distledger.LedgerEntry),
 		ledgerByUser:   make(map[distledger.UserKey][]int64),
 		ledgerByTenant: make(map[int64][]int64),
 	}
 }
 
-// Store 是 distledger.Store 的内存实现。零值不可用，请使用 New 构造。
+// Store is the in-memory implementation of distledger.Store.
+// The zero value is not usable; construct it with New.
 type Store struct {
 	mu     sync.RWMutex
 	d      *data
 	closed bool
 }
 
-// New 返回一个空的、可用的内存 Store。
+// New returns an empty, ready-to-use in-memory Store.
 func New() *Store { return &Store{d: newData()} }
 
-// StoreKind 实现 distledger.ReportedStore。
+// StoreKind implements distledger.ReportedStore.
 func (s *Store) StoreKind() string { return "memory" }
 
-// Close 释放 Store。重复调用安全。
+// Close releases the Store. It is safe to call repeatedly.
 //
-// 关闭后所有读写返回 ErrClosed；已写入的数据仍然保留，便于关闭后审计。
+// After closing, reads and writes return ErrClosed. The data is retained so it
+// can still be inspected.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -113,17 +151,18 @@ func (s *Store) Close() error {
 	return nil
 }
 
-// errNestedTx 表示在事务内部又开启了事务。
+// errNestedTx reports a transaction opened inside another transaction.
 //
-// 内存实现用全局互斥锁，嵌套事务会直接死锁。与其让调用方遇到一个卡死的
-// 进程，不如显式报错——死锁在生产环境里几乎无法定位。
+// The in-memory implementation uses a single mutex, so a nested transaction
+// would deadlock. Returning an error is far better than handing the caller a
+// hung process: a deadlock in production is nearly impossible to diagnose.
 var errNestedTx = errors.New("distledger/memory: nested transaction is not supported")
 
 type txMarkerKey struct{}
 
 func inTx(ctx context.Context) bool { return ctx.Value(txMarkerKey{}) != nil }
 
-// View 在只读事务中执行 fn。
+// View runs fn in a read-only transaction.
 func (s *Store) View(ctx context.Context, fn func(ctx context.Context, r distledger.Reader) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -139,10 +178,10 @@ func (s *Store) View(ctx context.Context, fn func(ctx context.Context, r distled
 	return fn(context.WithValue(ctx, txMarkerKey{}, true), &reader{d: s.d})
 }
 
-// Update 在读写事务中执行 fn。
+// Update runs fn in a read-write transaction.
 //
-// fn 返回错误时，本次事务内已完成的所有写入都会被撤销，
-// 数据回到事务开始前的状态。
+// If fn returns an error, every write it already performed is undone and the
+// data returns to its pre-transaction state.
 func (s *Store) Update(ctx context.Context, fn func(ctx context.Context, tx distledger.Tx) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -165,23 +204,75 @@ func (s *Store) Update(ctx context.Context, fn func(ctx context.Context, tx dist
 	return nil
 }
 
-// ── 撤销日志 ────────────────────────────────────────────────────────────
+// ── Undo log ────────────────────────────────────────────────────────────
+//
+// The in-memory store mutates the real maps and keeps an undo log rather than
+// staging writes in a journal. Readers therefore get read-your-writes for free,
+// and no other transaction can observe uncommitted data because the write lock
+// is held for the whole transaction.
 
 type undoEntry[V any] struct {
 	val     V
 	existed bool
 }
 
-// dueUndo 保存 pendingDue 的回滚信息。
-type dueUndo struct {
+// appendIndex is the undo record for an append-only slice index.
+type appendIndex struct {
+	length  int
+	existed bool
+}
+
+// orderedUndo is the undo record for an index that may change in the middle.
+type orderedUndo[T any] struct {
 	saved bool
-	// full 非 nil 表示已做全量快照，回滚时整体替换。
-	full []dueRef
-	// length 仅在 full 为 nil 时有效，表示原始长度。
+	// full is non-nil once a structural change forced a full snapshot; the
+	// slice is then restored wholesale.
+	full []T
+	// length is the pre-transaction length, valid only while full is nil.
 	length int
 }
 
-// undo 记录事务中被触碰过的对象在事务开始前的值。
+// noteAppend records a tail append. This is the cheap path.
+func (u *orderedUndo[T]) noteAppend(cur []T) {
+	if u.saved {
+		return
+	}
+	u.saved = true
+	u.length = len(cur)
+}
+
+// noteStructural records a middle insert or a delete, upgrading to a full
+// snapshot.
+//
+// The critical detail: if a length snapshot was already taken, everything up to
+// this point was a tail append, so the pre-transaction content is exactly
+// cur[:length]. Cloning the whole of cur would treat entries appended by this
+// transaction as if they had been there beforehand, and the rollback would
+// leave them behind.
+func (u *orderedUndo[T]) noteStructural(cur []T) {
+	if u.full != nil {
+		return
+	}
+	if u.saved {
+		u.full = slices.Clone(cur[:u.length])
+	} else {
+		u.full = slices.Clone(cur)
+	}
+	u.saved = true
+}
+
+// restore returns the slice as it was before the transaction.
+func (u *orderedUndo[T]) restore(cur []T) []T {
+	if !u.saved {
+		return cur
+	}
+	if u.full != nil {
+		return u.full
+	}
+	return cur[:u.length]
+}
+
+// undo records the pre-transaction value of everything a transaction touches.
 type undo struct {
 	agents      map[distledger.UserKey]undoEntry[distledger.Agent]
 	bindings    map[distledger.UserKey]undoEntry[distledger.Binding]
@@ -189,36 +280,44 @@ type undo struct {
 	commissions map[int64]undoEntry[distledger.Commission]
 	ledger      map[int64]undoEntry[distledger.LedgerEntry]
 	idem        map[idemRef]undoEntry[int64]
+	refunds     map[int64]undoEntry[distledger.Refund]
+	refundIdem  map[idemRef]undoEntry[int64]
 
-	// 纯追加的索引：只需记录原始长度。
-	byOrderLen        map[distledger.OrderKey]int
-	byAgentLen        map[distledger.UserKey]int
-	ledgerByUserLen   map[distledger.UserKey]int
-	ledgerByTenantLen map[int64]int
-	ledgerIDsLen      int
-	commissionIDsLen  int
+	// Append-only indexes: old length plus whether the key existed at all.
+	byOrder        map[distledger.OrderKey]appendIndex
+	byAgent        map[distledger.UserKey]appendIndex
+	refundsByOrder map[distledger.OrderKey]appendIndex
+	ledgerByUser   map[distledger.UserKey]appendIndex
+	ledgerByTenant map[int64]appendIndex
+	// The two global id slices always exist, so they only need a length.
+	ledgerIDsLen     int
+	commissionIDsLen int
 
-	// 需要在中间增删的索引：使用混合快照。
-	due dueUndo
+	// Ordered indexes: hybrid snapshots.
+	due        orderedUndo[dueRef]
+	accountIDs orderedUndo[distledger.UserKey]
 
 	nextID int64
 }
 
 func newUndo(d *data) *undo {
 	return &undo{
-		agents:            make(map[distledger.UserKey]undoEntry[distledger.Agent]),
-		bindings:          make(map[distledger.UserKey]undoEntry[distledger.Binding]),
-		accounts:          make(map[distledger.UserKey]undoEntry[distledger.Account]),
-		commissions:       make(map[int64]undoEntry[distledger.Commission]),
-		ledger:            make(map[int64]undoEntry[distledger.LedgerEntry]),
-		idem:              make(map[idemRef]undoEntry[int64]),
-		byOrderLen:        make(map[distledger.OrderKey]int),
-		byAgentLen:        make(map[distledger.UserKey]int),
-		ledgerByUserLen:   make(map[distledger.UserKey]int),
-		ledgerByTenantLen: make(map[int64]int),
-		ledgerIDsLen:      len(d.ledgerIDs),
-		commissionIDsLen:  len(d.commissionIDs),
-		nextID:            d.nextID,
+		agents:           make(map[distledger.UserKey]undoEntry[distledger.Agent]),
+		bindings:         make(map[distledger.UserKey]undoEntry[distledger.Binding]),
+		accounts:         make(map[distledger.UserKey]undoEntry[distledger.Account]),
+		commissions:      make(map[int64]undoEntry[distledger.Commission]),
+		ledger:           make(map[int64]undoEntry[distledger.LedgerEntry]),
+		idem:             make(map[idemRef]undoEntry[int64]),
+		refunds:          make(map[int64]undoEntry[distledger.Refund]),
+		refundIdem:       make(map[idemRef]undoEntry[int64]),
+		byOrder:          make(map[distledger.OrderKey]appendIndex),
+		byAgent:          make(map[distledger.UserKey]appendIndex),
+		refundsByOrder:   make(map[distledger.OrderKey]appendIndex),
+		ledgerByUser:     make(map[distledger.UserKey]appendIndex),
+		ledgerByTenant:   make(map[int64]appendIndex),
+		ledgerIDsLen:     len(d.ledgerIDs),
+		commissionIDsLen: len(d.commissionIDs),
+		nextID:           d.nextID,
 	}
 }
 
@@ -262,6 +361,22 @@ func saveLedger(u *undo, d *data, id int64) {
 	u.ledger[id] = undoEntry[distledger.LedgerEntry]{val: v, existed: existed}
 }
 
+func saveRefund(u *undo, d *data, id int64) {
+	if _, ok := u.refunds[id]; ok {
+		return
+	}
+	v, existed := d.refunds[id]
+	u.refunds[id] = undoEntry[distledger.Refund]{val: v, existed: existed}
+}
+
+func saveRefundIdem(u *undo, d *data, k idemRef) {
+	if _, ok := u.refundIdem[k]; ok {
+		return
+	}
+	v, existed := d.refundIdem[k]
+	u.refundIdem[k] = undoEntry[int64]{val: v, existed: existed}
+}
+
 func saveIdem(u *undo, d *data, k idemRef) {
 	if _, ok := u.idem[k]; ok {
 		return
@@ -270,64 +385,32 @@ func saveIdem(u *undo, d *data, k idemRef) {
 	u.idem[k] = undoEntry[int64]{val: v, existed: existed}
 }
 
-// 以下 trunc* 方法在向「纯追加索引」写入之前记录原始长度，
-// 回滚时按长度截断即可——因为这类索引永远不会在中间插入或删除。
-
-func (u *undo) truncByOrder(d *data, k distledger.OrderKey) {
-	if _, ok := u.byOrderLen[k]; !ok {
-		u.byOrderLen[k] = len(d.byOrder[k])
-	}
-}
-
-func (u *undo) truncByAgent(d *data, k distledger.UserKey) {
-	if _, ok := u.byAgentLen[k]; !ok {
-		u.byAgentLen[k] = len(d.byAgent[k])
-	}
-}
-
-func (u *undo) truncLedgerByUser(d *data, k distledger.UserKey) {
-	if _, ok := u.ledgerByUserLen[k]; !ok {
-		u.ledgerByUserLen[k] = len(d.ledgerByUser[k])
-	}
-}
-
-func (u *undo) truncLedgerByTenant(d *data, t int64) {
-	if _, ok := u.ledgerByTenantLen[t]; !ok {
-		u.ledgerByTenantLen[t] = len(d.ledgerByTenant[t])
-	}
-}
-
-// noteDueAppend 记录一次「尾部追加」。
-func (u *undo) noteDueAppend(d *data) {
-	if u.due.saved {
+// noteAppendIndex records the state of an append-only index before first use.
+func noteAppendIndex[K comparable, V any](u map[K]appendIndex, m map[K][]V, k K) {
+	if _, ok := u[k]; ok {
 		return
 	}
-	u.due.saved = true
-	u.due.length = len(d.pendingDue)
+	_, existed := m[k]
+	u[k] = appendIndex{length: len(m[k]), existed: existed}
 }
 
-// noteDueStructural 记录一次「中间插入或删除」。
+// restoreAppendIndex undoes every recorded append-only index change.
 //
-// 一旦发生结构性变更，必须升级为全量快照：此时按长度截断会恢复出
-// 元素错位的内容。
-//
-// 关键细节：如果此前已经记录过长度快照，说明到此刻为止只发生过尾部追加，
-// 因此**事务开始时的内容恰好是当前切片的前 length 个元素**。
-// 直接克隆整个当前切片会把本事务追加的条目也当成原始状态，
-// 导致回滚不彻底——索引里会残留本该消失的条目。
-func (u *undo) noteDueStructural(d *data) {
-	if u.due.full != nil {
-		return
+// Keys the transaction created are deleted rather than left behind as empty
+// slices: an empty slice is invisible to readers but keeps the map entry alive
+// forever, so a stream of failed transactions would grow the index without
+// bound.
+func restoreAppendIndex[K comparable, V any](u map[K]appendIndex, m map[K][]V) {
+	for k, s := range u {
+		if !s.existed {
+			delete(m, k)
+			continue
+		}
+		m[k] = m[k][:s.length]
 	}
-	if u.due.saved {
-		u.due.full = slices.Clone(d.pendingDue[:u.due.length])
-	} else {
-		u.due.full = slices.Clone(d.pendingDue)
-	}
-	u.due.saved = true
 }
 
-// rollback 把 data 恢复到事务开始前的状态。
+// rollback restores data to its pre-transaction state.
 func (u *undo) rollback(d *data) {
 	restoreMap(u.agents, d.agents)
 	restoreMap(u.bindings, d.bindings)
@@ -335,29 +418,19 @@ func (u *undo) rollback(d *data) {
 	restoreMap(u.commissions, d.commissions)
 	restoreMap(u.ledger, d.ledger)
 	restoreMap(u.idem, d.idem)
+	restoreMap(u.refunds, d.refunds)
+	restoreMap(u.refundIdem, d.refundIdem)
 
-	for k, n := range u.byOrderLen {
-		d.byOrder[k] = d.byOrder[k][:n]
-	}
-	for k, n := range u.byAgentLen {
-		d.byAgent[k] = d.byAgent[k][:n]
-	}
-	for k, n := range u.ledgerByUserLen {
-		d.ledgerByUser[k] = d.ledgerByUser[k][:n]
-	}
-	for k, n := range u.ledgerByTenantLen {
-		d.ledgerByTenant[k] = d.ledgerByTenant[k][:n]
-	}
+	restoreAppendIndex(u.byOrder, d.byOrder)
+	restoreAppendIndex(u.byAgent, d.byAgent)
+	restoreAppendIndex(u.refundsByOrder, d.refundsByOrder)
+	restoreAppendIndex(u.ledgerByUser, d.ledgerByUser)
+	restoreAppendIndex(u.ledgerByTenant, d.ledgerByTenant)
 	d.ledgerIDs = d.ledgerIDs[:u.ledgerIDsLen]
 	d.commissionIDs = d.commissionIDs[:u.commissionIDsLen]
 
-	if u.due.saved {
-		if u.due.full != nil {
-			d.pendingDue = u.due.full
-		} else {
-			d.pendingDue = d.pendingDue[:u.due.length]
-		}
-	}
+	d.pendingDue = u.due.restore(d.pendingDue)
+	d.accountIDs = u.accountIDs.restore(d.accountIDs)
 	d.nextID = u.nextID
 }
 

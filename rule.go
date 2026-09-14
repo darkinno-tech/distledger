@@ -8,60 +8,77 @@ import (
 	"strings"
 )
 
-// MaxLevels 是分销层级的硬上限。
+// MaxLevels is the hard ceiling on distribution depth.
 //
-// 它不是可配置项，而是刻意写死的合规兜底：三级以上分销在中国法律下
-// 即属高风险区（《禁止传销条例》《刑法》第 224 条之一）。
-// 允许运营把它配成 4 就是允许一次配置事故变成法律风险（见 ADR-011）。
+// It is not a configuration knob but a deliberately hard-coded compliance
+// backstop: distribution deeper than three levels sits in high-risk
+// territory under Chinese law (the Regulations on Prohibition of Pyramid
+// Selling and Article 224-1 of the Criminal Law). Letting operations set it
+// to 4 would let a single configuration accident become legal exposure (see
+// ADR-011).
 const MaxLevels = 3
 
-// MaxFreezeDays 是冻结期的上限（10 年）。
+// MaxFreezeDays is the upper bound on the freeze window (10 years).
 //
-// 上限存在的意义是防止误把「秒」当成「天」填进来，导致佣金永久不到账
-// 却又不报错——这类静默错误比直接报错难排查得多。
+// The bound exists to catch a freeze window entered in seconds where days
+// were meant, which would leave a commission permanently out of reach
+// without ever raising an error. Silent mistakes like that are far harder to
+// track down than an outright error.
 const MaxFreezeDays = 3650
 
-// MaxBindExpireDays 是绑定有效期的上限（100 年）。
+// MaxBindExpireDays is the upper bound on the binding validity period (100 years).
 const MaxBindExpireDays = 36500
 
-// Rules 是分销的**业务规则**。
+// Rules holds the **business rules** of distribution.
 //
-// 它只回答「算多少、分几级、什么时候到账」，绝不参与「钱怎么流」的决策。
-// 这是 ADR-002 定义的切分线：Rules 里的任何字段都无法改变状态机的形状。
+// It answers only "how much, at how many levels, and when does the money
+// land"; it never takes part in deciding how money flows. That is the split
+// defined by ADR-002: no field in Rules can change the shape of the state
+// machine.
 type Rules struct {
-	// Levels 是分佣层级数，取值 [1, MaxLevels]。默认 2。
+	// Levels is the number of commission levels, in [1, MaxLevels]. Default 2.
 	Levels int
 
-	// RateBP 是每一级的费率，长度必须等于 Levels。
+	// RateBP is the rate of each level; its length must equal Levels.
 	//
-	// 下标 0 对应第 1 级（订单归属的分销员本身）。默认全 0，
-	// 即「跑通链路但不发钱」——这是 ADR-010 的保守默认。
+	// Index 0 is level 1 (the agent the order is attributed to). The
+	// default is all zeros, i.e. "the chain works but no money is paid out",
+	// which is the conservative default of ADR-010.
 	RateBP []Rate
 
-	// Rounding 是佣金计算时的舍入方式。默认 RoundDown。
+	// Rounding is the rounding mode used when computing commissions.
+	// Defaults to RoundDown.
 	Rounding Rounding
 
-	// FreezeDays 是「确认收货后 N 天可提现」。默认 7。
+	// FreezeDays is "withdrawable N days after receipt confirmation".
+	// Default 7.
 	//
-	// 它会在佣金入账时被**快照**进佣金单，因此修改本字段不会追溯
-	// 影响已入账的佣金（见 ADR-005）。
+	// It is **snapshotted** into the commission when that commission is
+	// accrued, so changing this field does not retroactively affect
+	// commissions already accrued (see ADR-005).
 	FreezeDays int
 
-	// MaxAllocatableBP 是本笔订单可分佣总额占计佣基数的比例上限，默认 100%。
+	// MaxAllocatableBP caps, as a ratio of the commission base, how much one
+	// order may pay out in total. Defaults to 100%.
 	//
-	// 它是平台侧的最后一道闸门：即使 RateBP 被误配成 {5000, 5000}（合计 100%），
-	// 引擎仍会保证分出去的佣金不超过基数。校验期也会拦下非法的 RateBP 组合，
-	// 本字段是运行期的双保险（见 PRD 不变量 I2）。
+	// It is the platform-side last gate: even if RateBP is misconfigured as
+	// {5000, 5000} (100% in total), the engine still guarantees that the
+	// commissions paid out never exceed the base. Validation rejects illegal
+	// RateBP combinations too, so this field is the runtime second line of
+	// defence (see PRD invariant I2).
 	MaxAllocatableBP Rate
 
-	// BindExpireDays 是买家绑定关系的有效期（天）。0 表示永久有效。默认 0。
+	// BindExpireDays is the validity period of a buyer binding, in days.
+	// 0 means it never expires. Default 0.
 	BindExpireDays int
 }
 
-// DefaultRules 返回保守的默认规则。
+// DefaultRules returns the conservative default rules.
 //
-// 费率为 0、层级为 2、冻结期 7 天、人工审核式结算。首次接入者必须显式
-// 配置费率才会真的发出佣金——这一步是刻意的确认动作（见 ADR-010）。
+// Zero rates, two levels, a 7-day freeze window and settlement driven by the
+// caller rather than by any internal timer. A first integration must
+// configure rates explicitly before any commission is actually paid out; that
+// step is a deliberate confirmation (see ADR-010).
 func DefaultRules() Rules {
 	return Rules{
 		Levels:           2,
@@ -73,32 +90,38 @@ func DefaultRules() Rules {
 	}
 }
 
-// Normalize 补齐零值字段，使 Rules 可以直接被部分初始化。
+// Normalize fills in zero-valued fields so that Rules can be partially
+// initialized.
 //
-// 规则：只对「零值无意义」的字段做补齐。Levels 为零是非法而非默认，
-// 因此必须由调用方显式指定或整体使用 DefaultRules()。
+// The rule: only fields whose zero value is meaningless are filled in.
+// A zero Levels is illegal rather than a default, so the caller must set it
+// explicitly or use DefaultRules() as a whole.
 func (r Rules) Normalize() Rules {
-	// Rounding 的零值就是 RoundDown，因此「未设置」与「显式要截断」无法区分，
-	// 也无需区分——两者结果一致，且都是最保守的选择。
+	// The zero value of Rounding is RoundDown, so "unset" and "explicitly
+	// truncate" cannot be told apart — and there is no need to: both give the
+	// same result, and both are the most conservative choice.
 	if r.MaxAllocatableBP == 0 {
 		r.MaxAllocatableBP = MaxRateBP
 	}
 	if r.Levels == 0 {
 		r.Levels = 2
 	}
-	// 只在费率整体缺省时补齐。长度非零但与 Levels 不符属于配置错误，
-	// 必须报错而不是静默补零——静默补零会把「少配了一级」变成
-	// 「那一级不发钱」，是一个不会报警的错误。
+	// Fill in rates only when they are missing entirely. A non-zero length
+	// that does not match Levels is a configuration error and must be
+	// reported rather than silently zero-filled: silent zero-filling turns
+	// "one level was left unconfigured" into "that level pays nothing", an
+	// error that never raises an alarm.
 	if len(r.RateBP) == 0 {
 		r.RateBP = make([]Rate, r.Levels)
 	}
 	return r
 }
 
-// Validate 校验规则是否自洽。
+// Validate checks that the rules are self-consistent.
 //
-// 校验失败的规则一律拒绝启动，而不是「尽力而为」——带着错误规则跑起来
-// 的结果是发出错误的钱，而那不可撤销。
+// Rules that fail validation are always rejected at startup rather than
+// handled best-effort: running with broken rules pays out the wrong money,
+// and that cannot be undone.
 func (r Rules) Validate() error {
 	if r.Levels < 1 || r.Levels > MaxLevels {
 		return fieldErrf("rules.levels", "must be in [1, %d], got %d", MaxLevels, r.Levels)
@@ -140,10 +163,13 @@ func (r Rules) Validate() error {
 	return nil
 }
 
-// Describe 返回规则的紧凑描述，用于写进佣金单的 RuleSnapshot。
+// Describe returns a compact description of the rules, for the RuleSnapshot
+// written onto a commission.
 //
-// 刻意不含时间戳与机器信息：同一份规则必须产生完全相同的快照字符串，
-// 这样「哪些佣金用了同一版规则」可以直接用字符串比较来分组统计。
+// It deliberately excludes timestamps and machine information: the same rules
+// must always produce exactly the same snapshot string, so that "which
+// commissions used the same version of the rules" can be grouped and counted
+// with a plain string comparison.
 func (r Rules) Describe() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, `{"levels":%d,"rate_bp":[`, r.Levels)
@@ -158,48 +184,70 @@ func (r Rules) Describe() string {
 	return b.String()
 }
 
-// Version 返回规则集的**内容指纹**。
+// Version returns the **content fingerprint** of the rule set.
 //
-// 它是一个内容寻址的版本号：同一份规则永远得到同一个值，规则任一处变化
-// 都会得到不同的值。佣金单上记录它，就能在三个月后回答
-// 「这笔佣金是按哪一版规则算出来的」。
+// It is a content-addressed version number: the same rules always yield the
+// same value, and a change anywhere in the rules yields a different one.
+// Recording it on a commission makes it possible to answer, three months
+// later, "which version of the rules was this commission computed with".
 //
-// 这里刻意不用「自增版本号 + 版本表」：那需要额外的持久化与运维流程，
-// 而内容指纹在 v0.1 就能提供同样的可解释性。
+// A self-incrementing version number plus a version table is deliberately
+// avoided here: that would need extra persistence and operational process,
+// while a content fingerprint already delivers the same explainability in
+// v0.1.
 func (r Rules) Version() int64 {
 	sum := sha256.Sum256([]byte(r.Describe()))
-	// 右移一位保证结果恒为非负，便于在日志与 SQL 里阅读。
+	// Shifting right by one guarantees a non-negative result, which makes it
+	// easier to read in logs and SQL.
 	return int64(binary.BigEndian.Uint64(sum[:8]) >> 1)
 }
 
-// RateInput 是费率解析的输入。
+// RateInput is the input to rate resolution.
 type RateInput struct {
 	Order OrderKey
-	// Layer 从 1 开始。
+	// Layer starts at 1.
 	Layer int
 	Agent Agent
 	Rules Rules
 }
 
-// RateResolver 决定「第 layer 级应当使用什么费率」。
+// RateResolver decides which rate level `layer` should use.
 //
-// 这是规则层的核心扩展点。默认实现按「个体覆盖 > 全局规则」的顺序解析，
-// 覆盖了绝大多数场景；只有形如「按商品类目浮动」「按等级阶梯」这类
-// 结构化配置表达不了的诉求，才需要自己实现它（见 ADR-002）。
+// This is the core extension point of the rules layer. The default
+// implementation resolves in the order "per-agent override > global rules",
+// which covers the vast majority of cases; implement your own only for
+// requirements that structured configuration cannot express, such as "float
+// by product category" or "tier by agent rank" (see ADR-002).
 type RateResolver interface {
 	ResolveRate(ctx context.Context, in RateInput) (Rate, error)
 }
 
-// EligibilityChecker 判定某个分销员是否有资格就这笔订单获得佣金。
-//
-// 默认实现要求分销员处于 AgentActive 状态。实现必须返回
-// (false, reason) 而不是 error 来表达「不符合资格」——那是业务结论，
-// 不是程序错误。
-type EligibilityChecker interface {
-	Eligible(ctx context.Context, agent Agent, order OrderKey) (bool, string)
+// EligibilityInput is everything an EligibilityChecker needs to decide whether
+// one agent may earn from one order.
+type EligibilityInput struct {
+	Agent Agent
+	Order OrderKey
+	// BuyerUserID is the buyer of the order.
+	//
+	// It is part of the input because self-purchase is the single most common
+	// abuse of a distribution programme: a agent buys through their own
+	// link and pays themselves a commission. An eligibility hook that cannot
+	// see the buyer cannot express that rule at all.
+	BuyerUserID int64
 }
 
-// defaultRateResolver 是默认费率解析器。
+// EligibilityChecker decides whether an agent is eligible for a commission
+// on one order.
+//
+// The default implementation requires the agent to be in the AgentActive
+// state and the buyer not to be the agent itself. Implementations must return
+// (false, reason) rather than an error to express "not eligible": that is a
+// business conclusion, not a program failure.
+type EligibilityChecker interface {
+	Eligible(ctx context.Context, in EligibilityInput) (bool, string)
+}
+
+// defaultRateResolver is the default rate resolver.
 type defaultRateResolver struct{}
 
 func (defaultRateResolver) ResolveRate(_ context.Context, in RateInput) (Rate, error) {
@@ -214,12 +262,24 @@ func (defaultRateResolver) ResolveRate(_ context.Context, in RateInput) (Rate, e
 	return in.Rules.RateBP[idx], nil
 }
 
-// defaultEligibility 是默认资格判定器：只有启用状态的分销员参与分佣。
+// defaultEligibility is the default eligibility rule.
+//
+// It enforces two things, both of them conservative defaults rather than
+// configurable switches (see ADR-022: no configuration without a real
+// implementation behind it):
+//
+//  1. The agent must be active.
+//  2. The buyer must not be the agent. Self-purchase is the classic way to
+//     launder a discount into commission, so it is off by default. Integrations
+//     that genuinely want it supply their own EligibilityChecker.
 type defaultEligibility struct{}
 
-func (defaultEligibility) Eligible(_ context.Context, agent Agent, _ OrderKey) (bool, string) {
-	if agent.Status != AgentActive {
-		return false, "agent status is " + agent.Status.String()
+func (defaultEligibility) Eligible(_ context.Context, in EligibilityInput) (bool, string) {
+	if in.Agent.Status != AgentActive {
+		return false, "agent status is " + in.Agent.Status.String()
+	}
+	if in.BuyerUserID != 0 && in.Agent.Key.UserID == in.BuyerUserID {
+		return false, "self-purchase is not eligible by default"
 	}
 	return true, ""
 }

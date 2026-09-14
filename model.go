@@ -5,26 +5,28 @@ import (
 	"time"
 )
 
-// JoinType 描述分销员的加入方式。
+// JoinType describes how an agent joined the programme.
 //
-// 注意：JoinPaid（付费加入）只是**状态标记**，不参与任何计酬计算。
-// 库刻意不提供「付费成为分销员即可获得返佣资格」这类链路——
-// 「入门费 + 拉人头」的组合正是传销判定的核心（见 ADR-011、PRD §15.2）。
+// Note: JoinPaid (paid enrolment) is only a **status marker** and takes no part
+// in any payout computation. The library deliberately offers no path of the
+// form "pay to become an agent and thereby qualify for commission" — the
+// combination of an entry fee plus recruitment of downlines is the core of a
+// pyramid-scheme finding (see ADR-011, PRD §15.2).
 type JoinType uint8
 
 const (
-	// JoinFree 表示无门槛加入。
+	// JoinFree means the agent joined with no entry requirement.
 	JoinFree JoinType = iota
-	// JoinReviewed 表示需要审核后加入。
+	// JoinReviewed means the agent joined after a review.
 	JoinReviewed
-	// JoinPaid 表示付费加入（仅状态标记）。
+	// JoinPaid means the agent paid to join (a status marker only).
 	JoinPaid
 )
 
-// Valid 报告加入方式是否在已知取值范围内。
+// Valid reports whether the join type is a known value.
 func (j JoinType) Valid() bool { return j <= JoinPaid }
 
-// String 返回加入方式的英文名。
+// String returns the English name of the join type.
 func (j JoinType) String() string {
 	switch j {
 	case JoinFree:
@@ -38,22 +40,24 @@ func (j JoinType) String() string {
 	}
 }
 
-// AgentStatus 描述分销员的生命周期状态。
+// AgentStatus describes the lifecycle state of an agent.
 type AgentStatus uint8
 
 const (
-	// AgentInactive 表示已登记但尚未生效，不参与分佣。
+	// AgentInactive means the agent is registered but not yet active and earns
+	// no commission.
 	AgentInactive AgentStatus = iota
-	// AgentActive 表示正常，参与分佣。
+	// AgentActive means the agent is in good standing and earns commission.
 	AgentActive
-	// AgentDisabled 表示已禁用，不参与分佣，且其下级的归属链在此处截断。
+	// AgentDisabled means the agent is disabled, earns no commission, and the
+	// attribution chain of its downlines is truncated here.
 	AgentDisabled
 )
 
-// Valid 报告状态是否在已知取值范围内。
+// Valid reports whether the status is a known value.
 func (s AgentStatus) Valid() bool { return s <= AgentDisabled }
 
-// String 返回状态名。
+// String returns the status name.
 func (s AgentStatus) String() string {
 	switch s {
 	case AgentInactive:
@@ -67,44 +71,49 @@ func (s AgentStatus) String() string {
 	}
 }
 
-// Agent 是一个分销员。
+// Agent is one agent.
 //
-// 关系链用「父指针 + 深度」表达。之所以不在 v0.1 引入物化路径（path），
-// 是因为深度被硬限制在 3 以内，向上遍历最多 3 步，路径带来的复杂度
-// 换不来可测量的收益；等到需要「查整个团队」时再引入（见 ADR-006）。
+// The relation chain is expressed as a parent pointer plus a depth. A
+// materialised path was deliberately left out of v0.1: the depth is hard-capped
+// at 3, so walking upwards takes at most 3 steps and a path would add
+// complexity with no measurable payoff; it can be introduced when "query the
+// whole team" becomes a requirement (see ADR-006).
 type Agent struct {
 	Key      UserKey
 	ParentID int64
-	// Depth 是层级深度，顶级为 1。等于「向上到根的最少步数 + 1」。
+	// Depth is the level depth, 1 for a top-level agent. It equals "the
+	// minimum number of steps up to the root, plus 1".
 	Depth    int
 	Status   AgentStatus
 	JoinType JoinType
-	// RateOverrideBP 非 nil 时覆盖全局费率，用于「金牌分销员」这类个体差异。
+	// RateOverrideBP, when non-nil, overrides the global rate for per-agent
+	// differences such as "gold" agents.
 	RateOverrideBP *Rate
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
-	// Version 是乐观锁版本号，每次持久化递增。
+	// Version is the optimistic-locking version, incremented on every persist.
 	Version int64
 }
 
-// BindSource 描述绑定关系的来源，用于归因分析与反作弊。
+// BindSource describes where a binding came from, for attribution analysis and
+// anti-fraud.
 type BindSource uint8
 
 const (
-	// SourceLink 表示通过推广链接绑定。
+	// SourceLink means the binding came from a referral link.
 	SourceLink BindSource = iota + 1
-	// SourceInviteCode 表示通过邀请码绑定。
+	// SourceInviteCode means the binding came from an invite code.
 	SourceInviteCode
-	// SourceManual 表示后台人工绑定。
+	// SourceManual means an operator created the binding by hand.
 	SourceManual
-	// SourceSalesperson 表示导购工号绑定。
+	// SourceSalesperson means the binding came from a salesperson staff ID.
 	SourceSalesperson
 )
 
-// Valid 报告来源是否在已知取值范围内。
+// Valid reports whether the source is a known value.
 func (s BindSource) Valid() bool { return s >= SourceLink && s <= SourceSalesperson }
 
-// String 返回来源名。
+// String returns the source name.
 func (s BindSource) String() string {
 	switch s {
 	case SourceLink:
@@ -120,29 +129,32 @@ func (s BindSource) String() string {
 	}
 }
 
-// Binding 是「买家 → 分销员」的归因关系。
+// Binding is the "buyer → agent" attribution relation.
 //
-// 它刻意独立成表而不是冗余在订单上：绑定期限、抢客保护、换绑冷静期
-// 都需要修改绑定关系本身，塞进订单表就改不了历史（见 ADR-006）。
+// It is deliberately its own table rather than duplicated on the order: the
+// binding term, poaching protection and the rebinding cooldown all need to
+// modify the binding itself, and stuffing them into the order table would make
+// history unchangeable (see ADR-006).
 type Binding struct {
 	ID int64
-	// Buyer 是被绑定的买家。
+	// Buyer is the buyer being bound.
 	Buyer UserKey
-	// AgentUserID 是买家归属的分销员。
+	// AgentUserID is the agent the buyer is attributed to.
 	AgentUserID int64
 	Source      BindSource
 	SourceRef   string
 	BoundAt     time.Time
-	// ExpireAt 为零值表示永久有效。
+	// ExpireAt, when zero, means the binding never expires.
 	ExpireAt time.Time
-	// Active 为 false 表示该绑定已被替换或失效。
+	// Active false means this binding was replaced or has lapsed.
 	Active bool
-	// ReboundFrom 记录本绑定替换掉的旧绑定 ID，0 表示首次绑定。
+	// ReboundFrom records the ID of the binding this one replaced; 0 means a
+	// first-time binding.
 	ReboundFrom int64
 	Version     int64
 }
 
-// Effective 报告该绑定在 at 时刻是否生效。
+// Effective reports whether the binding is in effect at time at.
 func (b Binding) Effective(at time.Time) bool {
 	if !b.Active {
 		return false
@@ -153,28 +165,30 @@ func (b Binding) Effective(at time.Time) bool {
 	return at.Before(b.ExpireAt)
 }
 
-// CommissionState 描述佣金单的生命周期状态。
+// CommissionState describes the lifecycle state of a commission.
 type CommissionState uint8
 
 const (
-	// CommissionPending 表示已入账、待在冻结期结束后结算。
+	// CommissionPending means the commission is accrued and waits for
+	// settlement once the freeze window ends.
 	CommissionPending CommissionState = iota
-	// CommissionSettled 表示已结算，计入可提现余额。
+	// CommissionSettled means it is settled and counts towards the withdrawable
+	// balance.
 	CommissionSettled
-	// CommissionWithdrawn 表示已被提现。
+	// CommissionWithdrawn means it has been withdrawn.
 	CommissionWithdrawn
-	// CommissionReversed 表示已被退款冲正。
+	// CommissionReversed means it was reversed by a refund.
 	CommissionReversed
-	// CommissionFrozen 表示被风控冻结，等待人工处置。
+	// CommissionFrozen means risk control froze it pending manual handling.
 	CommissionFrozen
-	// CommissionVoid 表示已作废，不产生任何资金影响。
+	// CommissionVoid means it is void and has no financial effect whatsoever.
 	CommissionVoid
 )
 
-// Valid 报告状态是否在已知取值范围内。
+// Valid reports whether the state is a known value.
 func (s CommissionState) Valid() bool { return s <= CommissionVoid }
 
-// String 返回状态名。
+// String returns the state name.
 func (s CommissionState) String() string {
 	switch s {
 	case CommissionPending:
@@ -194,7 +208,7 @@ func (s CommissionState) String() string {
 	}
 }
 
-// Terminal 报告该状态是否终态（不再发生迁移）。
+// Terminal reports whether the state is final (no further transitions).
 func (s CommissionState) Terminal() bool {
 	switch s {
 	case CommissionWithdrawn, CommissionReversed, CommissionVoid:
@@ -204,59 +218,107 @@ func (s CommissionState) Terminal() bool {
 	}
 }
 
-// Commission 是一笔佣金。
+// Commission is one commission payout.
 //
-// # 可变性契约（重要）
+// # Mutability contract (important)
 //
-// 财务字段在创建后**永不改变**：
+// Financial fields **never change** after creation:
 //
 //	Key / IdemKey / OrderItemID / BuyerUserID / AgentUserID / Layer /
 //	BaseAmount / Rate / Amount / FreezeDays / RuleVersion / RuleSnapshot / AccruedAt
 //
-// 生命周期字段会随状态推进而变化，并且每次变化都必须携带 Version 做 CAS：
+// Lifecycle fields change as the state advances, and every change must carry a
+// Version for CAS:
 //
-//	State / AvailableAt / SettledAt / Version
+//	State / AvailableAt / SettledAt / ReversedAmount / Version
 //
-// 退款不修改 Amount，而是**追加一条负额记录**并把原记录置为 Reversed
-// （见 ADR-004）。这条契约由 Store 端口强制：写接口只有
-// AppendCommission / SetCommissionAvailableAt / TransitionCommission，
-// 不存在通用的 Update。
+// A refund does not modify Amount; it **appends a negative-amount record** and
+// marks the original as Reversed (see ADR-004). The Store port enforces this
+// contract: the only write methods are AppendCommission /
+// SetCommissionAvailableAt / TransitionCommission, and there is no generic
+// Update.
 type Commission struct {
 	ID int64
-	// Key 是被分佣的订单。
+	// Key is the order the commission was earned on.
 	Key OrderKey
-	// IdemKey 是幂等键，在同一租户内唯一。
+	// IdemKey is the idempotency key, unique within a tenant.
 	IdemKey     string
 	OrderItemID string
 	BuyerUserID int64
 	AgentUserID int64
-	// Layer 是层级：1 表示直接推广人，2 表示其上级，依此类推。
+	// Layer is the level: 1 is the direct referrer, 2 its upline, and so on.
 	Layer int
-	// BaseAmount 是计佣基数快照（已扣运费/平台券）。
+	// BaseAmount is the snapshotted commission base (shipping and platform
+	// coupons already deducted).
 	BaseAmount Money
-	// Rate 是费率快照。
+	// Rate is the snapshotted rate.
 	Rate Rate
-	// Amount 是佣金金额，正数表示入账（退款冲正记录为负数）。
+	// Amount is the commission amount; a positive value is an accrual (a refund
+	// reversal record is negative).
 	Amount Money
 	State  CommissionState
-	// FreezeDays 是冻结期快照。它保证「当时的规则决定当时的到账时间」，
-	// 后续修改全局配置不会追溯影响已入账的佣金（见 ADR-005）。
+	// FreezeDays is the snapshotted freeze window. It guarantees that "the
+	// rules in force at the time decide the payout time of the time": later
+	// edits to global configuration never retroactively affect commissions
+	// already accrued (see ADR-005).
 	FreezeDays int
-	// AvailableAt 是入库时间 + FreezeDays。零值表示订单尚未确认收货，
-	// 因此到账时间还不确定。
+	// AvailableAt is the accrual time plus FreezeDays. A zero value means the
+	// order has not been receipt-confirmed yet, so the payout time is not yet
+	// determined.
 	AvailableAt time.Time
-	// RuleVersion 指向入账时生效的规则版本。
+	// RuleVersion points at the rule version in force at accrual time.
 	RuleVersion int64
-	// RuleSnapshot 是命中规则的 JSON 快照，用于日后解释「为什么是这个数」。
+	// RuleSnapshot is a JSON snapshot of the matched rule, used later to
+	// explain "why this number".
 	RuleSnapshot string
 	AccruedAt    time.Time
 	SettledAt    time.Time
-	Version      int64
+	// ReversedAmount is the cumulative amount of this commission that has been
+	// reversed (positive, never greater than Amount).
+	//
+	// It is a lifecycle field rather than a financial field: Amount records
+	// "how much was computed back then", while ReversedAmount records "how much
+	// of that has been taken back by refunds". Keeping the two apart is what
+	// lets the original entry stay immutable while still answering "how much is
+	// left to settle".
+	//
+	// The reversal detail still lands in separate negative-amount records;
+	// ReversedAmount is the cumulative view over them. SelfCheck reconciles the
+	// two (invariant I3).
+	ReversedAmount Money
+	// ReverseOf, on a reversal record, points at the original commission ID
+	// that was reversed; it is 0 on forward records.
+	ReverseOf int64
+	Version   int64
 }
 
-// DueAt 报告该佣金在 at 时刻是否已到可结算时点。
+// OutstandingAmount returns the amount of this commission that is not yet
+// reversed.
 //
-// 尚未确认收货（AvailableAt 为零值）的佣金永远不到期。
+// It is the amount settlement should actually move from "pending" to
+// "withdrawable". Using Amount directly would settle a partially reversed
+// commission a second time, paying out money that was already taken back.
+func (c Commission) OutstandingAmount() Money { return c.Amount - c.ReversedAmount }
+
+// MaxReversible returns the upper bound of ReversedAmount.
+//
+// For a forward record the bound is its own amount; for a reversal record
+// (negative Amount) the bound is 0 — a reversal can never itself be reversed.
+func (c Commission) MaxReversible() Money {
+	if c.Amount <= 0 {
+		return 0
+	}
+	return c.Amount
+}
+
+// FullyReversed reports whether this commission has been fully reversed.
+func (c Commission) FullyReversed() bool { return c.Amount > 0 && c.ReversedAmount >= c.Amount }
+
+// DueAt reports whether the commission has reached its settleable point at
+// time at.
+//
+// A commission whose receipt is not yet confirmed (zero AvailableAt) is never
+// due.
 func (c Commission) DueAt(at time.Time) bool {
 	if c.AvailableAt.IsZero() {
 		return false
@@ -264,58 +326,104 @@ func (c Commission) DueAt(at time.Time) bool {
 	return !at.Before(c.AvailableAt)
 }
 
-// Account 是一个分销员的资金账户。
+// Account is one agent's money account.
 //
-// 四个桶刻意分开而不是只存一个「余额」：用户看到的必须是
-// 「待结算 / 可提现 / 提现中 / 已提现」四件事，糊成一个数字必然产生纠纷。
+// The four buckets are deliberately kept apart instead of a single stored
+// "balance": what users see must be four distinct things — pending settlement,
+// withdrawable, withdrawing, withdrawn — and collapsing them into one number is
+// guaranteed to cause disputes.
 type Account struct {
 	Key UserKey
-	// Frozen 是待结算金额（已入账、冻结期未满）。
+	// Frozen is the amount pending settlement (accrued, freeze window not over).
 	Frozen Money
-	// Available 是可提现金额。
+	// Available is the withdrawable amount.
 	Available Money
-	// Withdrawing 是提现中金额（已申请、未打款）。
+	// Withdrawing is the amount being withdrawn (requested, not yet paid out).
 	Withdrawing Money
-	// Withdrawn 是已提现金额。
+	// Withdrawn is the amount already paid out.
 	Withdrawn Money
-	// TotalEarned 是历史累计入账金额，只增不减；冲正不影响它，
-	// 冲正体现在流水与佣金单上。
+	// TotalEarned is the lifetime accrued amount (gross); it only ever grows.
 	TotalEarned Money
-	Version     int64
-	UpdatedAt   time.Time
+	// TotalReversed is the lifetime reversed amount (positive); it only ever
+	// grows.
+	//
+	// It is used in pairs with TotalEarned: net earnings = TotalEarned -
+	// TotalReversed. TotalEarned is left untouched by reversals in order to
+	// preserve "gross" as an independent fact — a field that only reflects the
+	// net cannot answer "how much commission has this agent generated in
+	// total".
+	TotalReversed Money
+	Version       int64
+	UpdatedAt     time.Time
 }
 
-// Settleable 报告账户的四个资金桶是否全部非负。
+// Settleable reports whether all four money buckets of the account are
+// non-negative.
 //
-// 这是不变量 I1 的一部分：任何时刻都不允许出现负的桶余额。
+// This is part of invariant I1: a negative bucket balance is never allowed.
 func (a Account) Settleable() bool {
 	return a.Frozen >= 0 && a.Available >= 0 && a.Withdrawing >= 0 && a.Withdrawn >= 0
 }
 
-// LedgerBizType 描述一次资金变动的业务类型。
+// Refund is the in-library record of one refund instalment for one accrual item.
+//
+// # Why this record has to exist
+//
+// Without it, two situations are indistinguishable: the same refund event being
+// delivered twice, and two genuine refunds of the same amount. Any design that
+// tries to derive the clawback from "the refund amount in this event" will
+// either double-apply a retry or ignore a legitimate second refund.
+//
+// The record carries the cumulative refunded amount for its item, so the
+// clawback can be expressed as a target
+// (amount x cumulative / base) rather than as a delta. Combined with a required
+// caller-supplied IdemKey, that makes retries free and repeated refunds exact.
+type Refund struct {
+	ID  int64
+	Key OrderKey
+	// ItemID matches Commission.OrderItemID; order-level accruals use "".
+	ItemID string
+	// Amount is what this instalment refunded for the item.
+	Amount Money
+	// Cumulative is the total refunded for the item up to and including this
+	// instalment. It never exceeds the item's accrual base.
+	Cumulative Money
+	// IdemKey identifies the refund event in the caller's system.
+	IdemKey    string
+	RefundedAt time.Time
+}
+
+// LedgerBizType describes the business type of one money movement.
 type LedgerBizType uint8
 
 const (
-	// LedgerAccrue 表示佣金入账（进入 Frozen）。
+	// LedgerAccrue means a commission accrual (into Frozen).
 	LedgerAccrue LedgerBizType = iota + 1
-	// LedgerSettle 表示冻结期满结算（Frozen → Available）。
+	// LedgerSettle means settlement at the end of the freeze window
+	// (Frozen → Available).
 	LedgerSettle
-	// LedgerReverse 表示退款冲正。
+	// LedgerReverse means a refund reversal.
 	LedgerReverse
-	// LedgerWithdrawHold 表示提现申请冻结（Available → Withdrawing）。
+	// LedgerVoid means a risk-control confiscation (the commission was judged
+	// not to exist and is clawed back in full).
+	LedgerVoid
+	// LedgerWithdrawHold means a withdrawal request holds funds
+	// (Available → Withdrawing).
 	LedgerWithdrawHold
-	// LedgerWithdrawPaid 表示提现打款完成（Withdrawing → Withdrawn）。
+	// LedgerWithdrawPaid means a withdrawal payout completed
+	// (Withdrawing → Withdrawn).
 	LedgerWithdrawPaid
-	// LedgerWithdrawRefund 表示提现驳回退回（Withdrawing → Available）。
+	// LedgerWithdrawRefund means a rejected withdrawal returns funds
+	// (Withdrawing → Available).
 	LedgerWithdrawRefund
-	// LedgerManualAdjust 表示人工调整。
+	// LedgerManualAdjust means a manual adjustment.
 	LedgerManualAdjust
 )
 
-// Valid 报告业务类型是否在已知取值范围内。
+// Valid reports whether the business type is a known value.
 func (t LedgerBizType) Valid() bool { return t >= LedgerAccrue && t <= LedgerManualAdjust }
 
-// String 返回业务类型名。
+// String returns the business type name.
 func (t LedgerBizType) String() string {
 	switch t {
 	case LedgerAccrue:
@@ -324,6 +432,8 @@ func (t LedgerBizType) String() string {
 		return "settle"
 	case LedgerReverse:
 		return "reverse"
+	case LedgerVoid:
+		return "void"
 	case LedgerWithdrawHold:
 		return "withdraw_hold"
 	case LedgerWithdrawPaid:
@@ -337,18 +447,32 @@ func (t LedgerBizType) String() string {
 	}
 }
 
-// LedgerEntry 是资金流水的一条记录。
+// referencesCommission reports whether a ledger entry's BizID points at a
+// commission record.
+func (t LedgerBizType) referencesCommission() bool {
+	switch t {
+	case LedgerAccrue, LedgerReverse, LedgerVoid:
+		return true
+	default:
+		return false
+	}
+}
+
+// LedgerEntry is one record of the money ledger.
 //
-// 它是**复式记账**的落点：每一次账户余额变动都必须产生一条流水，
-// 且流水同时记录「变动量」与「变动后余额」。后者让对账可以只看单条记录
-// 就能判断当时的余额状态，而不必重放全部历史。
+// It is the landing point of **double-entry bookkeeping**: every change to an
+// account balance must produce a ledger entry, and the entry records both the
+// delta and the balance after the change. The latter lets reconciliation judge
+// the balance at that moment from a single record rather than replaying the
+// whole history.
 //
-// 流水**只追加、永不修改、永不删除**（见 ADR-004）。
+// Ledger entries are **append-only: never modified, never deleted** (see
+// ADR-004).
 type LedgerEntry struct {
 	ID      int64
 	Key     UserKey
 	BizType LedgerBizType
-	// BizID 关联业务单据（佣金 ID 或提现单 ID）。
+	// BizID links the business document (a commission ID or a withdrawal ID).
 	BizID string
 
 	DeltaFrozen      Money
@@ -365,7 +489,8 @@ type LedgerEntry struct {
 	CreatedAt time.Time
 }
 
-// NetDelta 返回四个桶的变动总量，用于快速校验流水是否「凭空造钱」。
+// NetDelta returns the total change across the four buckets, used to check
+// quickly whether a ledger entry mints money out of thin air.
 func (e LedgerEntry) NetDelta() Money {
 	return e.DeltaFrozen + e.DeltaAvailable + e.DeltaWithdrawing + e.DeltaWithdrawn
 }

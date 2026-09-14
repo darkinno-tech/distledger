@@ -46,9 +46,10 @@ func TestMulDivRejectsZeroDivisor(t *testing.T) {
 	}
 }
 
-// TestMulDivNeverOverflowsSilently 是本包最重要的测试。
+// TestMulDivNeverOverflowsSilently is the most important test in this package.
 //
-// 它验证「要么给出正确答案，要么明确报告溢出」，绝不存在第三种结果。
+// It verifies that there is either a correct answer or an explicit overflow
+// report, and never a third outcome.
 func TestMulDivNeverOverflowsSilently(t *testing.T) {
 	inputs := []uint64{0, 1, 2, 3, 7, 255, 256, 1 << 31, 1<<32 - 1, 1 << 62, math.MaxUint64}
 	divisors := []uint64{1, 2, 3, 10, 10000, 1 << 32, 1<<63 - 1, math.MaxUint64}
@@ -60,7 +61,7 @@ func TestMulDivNeverOverflowsSilently(t *testing.T) {
 				if !ok {
 					continue
 				}
-				// 用 128 位乘法反推：got*d <= a*b < (got+1)*d
+				// Check with 128-bit multiplication: got*d <= a*b < (got+1)*d
 				hi1, lo1 := mul128(got, d)
 				hi2, lo2 := mul128(a, b)
 				if !le128(hi1, lo1, hi2, lo2) {
@@ -136,7 +137,8 @@ func TestSubOverflow(t *testing.T) {
 		{math.MaxInt64, math.MaxInt64, 0, true},
 		{math.MinInt64, math.MaxInt64, 0, false},
 		{math.MaxInt64, math.MinInt64, 0, false},
-		// -1 - MaxInt64 == MinInt64，恰好可表示，因此不是溢出。
+		// -1 - MaxInt64 == MinInt64, which is exactly representable, so it is not an
+		// overflow.
 		{-1, math.MaxInt64, math.MinInt64, true},
 		{math.MinInt64, -1, math.MinInt64 + 1, true},
 	}

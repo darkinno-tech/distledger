@@ -5,61 +5,81 @@ import (
 	"fmt"
 )
 
-// 哨兵错误。调用方应始终使用 errors.Is 判断，而不要比较错误字符串。
+// Sentinel errors. Callers must always test them with errors.Is rather than
+// comparing error strings.
 //
-// 设计原则：错误里只包含调用方提供的输入信息，不泄露内部实现细节或
-// 其他租户/用户的数据（见 PRD §15 安全考量）。
+// Design principle: an error carries only input supplied by the caller and never
+// leaks internal implementation details or data belonging to other tenants or
+// users (see PRD §15, security considerations).
 var (
-	// ErrInvalidArgument 表示调用方传入的参数不合法（缺少必填字段、数值越界等）。
+	// ErrInvalidArgument reports an invalid argument from the caller, such as a
+	// missing required field or an out-of-range value.
 	ErrInvalidArgument = errors.New("distledger: invalid argument")
 
-	// ErrNotFound 表示查询的对象不存在。
+	// ErrNotFound reports that the requested object does not exist.
 	ErrNotFound = errors.New("distledger: not found")
 
-	// ErrDuplicate 表示幂等键冲突：同一笔账务动作已经入账过。
+	// ErrDuplicate reports an idempotency key conflict: the same ledger action has
+	// already been posted.
 	//
-	// 这不是错误状态——它是幂等保证生效的标志。OnOrderPaid 等入口会把
-	// 重复投递转换为「成功且无副作用」的正常返回。
+	// This is not a failure state — it is the sign that the idempotency guarantee
+	// is working. Entry points such as OnOrderPaid turn a duplicate delivery into
+	// a normal return of "success with no side effects".
 	ErrDuplicate = errors.New("distledger: duplicate idempotency key")
 
-	// ErrIllegalTransition 表示一次非法的状态迁移。
+	// ErrIllegalTransition reports an illegal state transition.
 	//
-	// 库绝不会「猜测」意图：非法迁移一律报错，不做任何兜底修正。
+	// The library never guesses at intent: an illegal transition is always an error,
+	// with no best-effort correction.
 	ErrIllegalTransition = errors.New("distledger: illegal state transition")
 
-	// ErrConflict 表示乐观锁版本冲突，即对象在读取之后被并发修改。
+	// ErrConflict reports an optimistic locking version conflict: the object was
+	// modified concurrently after it was read.
 	ErrConflict = errors.New("distledger: concurrent modification")
 
-	// ErrCycle 表示父子关系构成了环。
+	// ErrCycle reports that a parent-child relation forms a cycle.
 	ErrCycle = errors.New("distledger: relation cycle detected")
 
-	// ErrDepthExceeded 表示层级深度超过配置上限。
+	// ErrDepthExceeded reports that the hierarchy depth exceeds the configured limit.
 	ErrDepthExceeded = errors.New("distledger: relation depth exceeded")
 
-	// ErrParentAlreadySet 表示分销员的上级已经设置过，且与本次请求不同。
+	// ErrParentAlreadySet reports that the agent's parent is already set and differs
+	// from the one in this request.
 	//
-	// 这是刻意的保护：擅自改上级会导致整个下级树的归属被悄悄重写。
+	// This guard is deliberate: silently reassigning a parent would quietly rewrite
+	// the ownership of the entire downstream tree.
 	ErrParentAlreadySet = errors.New("distledger: parent already set")
 
-	// ErrInvalidConfig 表示配置不自洽。
+	// ErrInvalidConfig reports an inconsistent configuration.
 	ErrInvalidConfig = errors.New("distledger: invalid config")
 
-	// ErrOverflow 表示金额运算溢出。出现即代表输入规模超出设计边界。
+	// ErrInsufficientBalance reports that a funds bucket does not hold enough balance
+	// to complete a reversal.
+	//
+	// In v0.3 this path is unreachable: with no withdrawals, the money being reversed
+	// is necessarily still sitting in the bucket. It is a safety net reserved for
+	// v0.5 — once withdrawals exist, reclaiming money that has already been taken
+	// out needs a debt strategy rather than pushing the bucket negative.
+	ErrInsufficientBalance = errors.New("distledger: insufficient balance for reversal")
+
+	// ErrOverflow reports an amount arithmetic overflow. Seeing it means the input
+	// scale is beyond the designed bounds.
 	ErrOverflow = errors.New("distledger: amount overflow")
 
-	// ErrClosed 表示 Ledger 已经被关闭。
+	// ErrClosed reports that the Ledger has been closed.
 	ErrClosed = errors.New("distledger: ledger closed")
 
-	// ErrBindingLocked 表示买家已经绑定到另一个分销员，且该绑定在归因时刻
-	// 仍然有效。
+	// ErrBindingLocked reports that the buyer is already bound to another agent and
+	// that the binding is still in effect at attribution time.
 	//
-	// 它的存在是为了防抢客：没有这道闸门，任何人都可以在看到订单之后
-	// 把自己绑成买家的推广人。BindBuyer 在返回该错误的同时**会返回现有
-	// 的绑定**，调用方可以直接使用。
+	// It exists to prevent poaching: without this gate, anyone could see an order
+	// and then bind themselves as the buyer's promoter. When BindBuyer returns
+	// this error it **also returns the existing binding**, which the caller can
+	// use directly.
 	ErrBindingLocked = errors.New("distledger: buyer already bound to another agent")
 )
 
-// FieldError 描述某个字段的校验失败，并包装 ErrInvalidArgument。
+// FieldError describes a field validation failure and wraps ErrInvalidArgument.
 type FieldError struct {
 	Field  string
 	Reason string
@@ -69,7 +89,7 @@ func (e *FieldError) Error() string {
 	return fmt.Sprintf("distledger: invalid %s: %s", e.Field, e.Reason)
 }
 
-// Unwrap 使 errors.Is(err, ErrInvalidArgument) 成立。
+// Unwrap makes errors.Is(err, ErrInvalidArgument) true.
 func (e *FieldError) Unwrap() error { return ErrInvalidArgument }
 
 func fieldErr(field, reason string) error {
@@ -80,7 +100,8 @@ func fieldErrf(field, format string, args ...any) error {
 	return &FieldError{Field: field, Reason: fmt.Sprintf(format, args...)}
 }
 
-// TransitionError 描述一次非法的状态迁移，并包装 ErrIllegalTransition。
+// TransitionError describes an illegal state transition and wraps
+// ErrIllegalTransition.
 type TransitionError struct {
 	Kind string
 	From string
@@ -91,10 +112,10 @@ func (e *TransitionError) Error() string {
 	return fmt.Sprintf("distledger: illegal %s transition: %s -> %s", e.Kind, e.From, e.To)
 }
 
-// Unwrap 使 errors.Is(err, ErrIllegalTransition) 成立。
+// Unwrap makes errors.Is(err, ErrIllegalTransition) true.
 func (e *TransitionError) Unwrap() error { return ErrIllegalTransition }
 
-// ConflictError 描述乐观锁冲突，并包装 ErrConflict。
+// ConflictError describes an optimistic locking conflict and wraps ErrConflict.
 type ConflictError struct {
 	Kind     string
 	ID       any
@@ -107,5 +128,5 @@ func (e *ConflictError) Error() string {
 		e.Kind, e.ID, e.Expected, e.Actual)
 }
 
-// Unwrap 使 errors.Is(err, ErrConflict) 成立。
+// Unwrap makes errors.Is(err, ErrConflict) true.
 func (e *ConflictError) Unwrap() error { return ErrConflict }

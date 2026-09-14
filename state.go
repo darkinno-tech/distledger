@@ -1,43 +1,58 @@
 package distledger
 
-// 本文件是内核中唯一「写死」的状态迁移定义。
+// This file holds the only hard-coded state transition definition in the
+// kernel.
 //
-// 为什么状态机不可插拔：状态机决定「钱能怎么流」。如果用户能替换状态机，
-// 库就无法对任何不变量负责，也就失去了存在的意义（见 ADR-002）。
-// 用户能改变的只有「钱的数值」——费率、层级数、门槛，那些在 rule.go 里。
+// Why the state machine is not pluggable: the state machine decides how money
+// is allowed to flow. If a user could replace it, the library could not be
+// accountable for any invariant and would lose its reason to exist (see
+// ADR-002). The only thing users can change is the numbers — rates, level
+// counts, thresholds — and those live in rule.go.
 
-// commissionTransitions 是佣金单的合法迁移表。
+// commissionTransitions is the table of legal transitions for a commission.
 //
-// 迁移表用「显式枚举」而不是 if/else 链，好处是可以被穷举测试：
-// transition_test.go 会遍历全部 6×6 组合并核对本表的每一项。
+// The table uses explicit enumeration rather than an if/else chain, which makes
+// it exhaustively testable: transition_test.go walks all 6×6 combinations and
+// checks every entry of this table.
 var commissionTransitions = map[CommissionState][]CommissionState{
-	// 待结算：可结算、可被退款冲正、可被风控冻结、可作废。
+	// Pending: can settle, be reversed by a refund, be frozen by risk control,
+	// or be voided.
 	CommissionPending: {
 		CommissionSettled,
 		CommissionReversed,
 		CommissionFrozen,
 		CommissionVoid,
 	},
-	// 已结算：可被提现、可被退款冲正。
+	// Settled: can be withdrawn or reversed by a refund.
 	CommissionSettled: {
 		CommissionWithdrawn,
 		CommissionReversed,
 	},
-	// 风控冻结：申诉通过回到待结算，或申诉失败作废。
+	// Frozen by risk control: a successful appeal returns it to pending, a
+	// failed appeal voids it, and an order refund reverses it directly.
+	//
+	// Frozen -> Reversed is mandatory: the money of a risk-frozen commission
+	// still sits in the "pending settlement" bucket, so a refund has to be able
+	// to take it back, otherwise the money would be stuck forever in an
+	// intermediate state that neither pays out nor returns it.
 	CommissionFrozen: {
 		CommissionPending,
 		CommissionVoid,
+		CommissionReversed,
 	},
-	// 以下为终态，不再迁移。
+	// The following are final states and never transition.
 	//
-	// CommissionWithdrawn 之所以是终态：钱已经出账，追回属于资金动作
-	// （走 Reverse 策略与负余额策略），不属于状态迁移（v0.3 交付）。
+	// CommissionWithdrawn is final because the money has already left the
+	// account; clawing it back is a money movement (through the Reverse policy
+	// and the negative-balance policy), not a state transition (delivered in
+	// v0.3).
 	CommissionWithdrawn: nil,
 	CommissionReversed:  nil,
 	CommissionVoid:      nil,
 }
 
-// allCommissionStates 按声明顺序列出全部状态，用于穷举测试与遍历。
+// allCommissionStates lists every state in declaration order, for exhaustive
+// tests and iteration.
 var allCommissionStates = []CommissionState{
 	CommissionPending,
 	CommissionSettled,
@@ -47,20 +62,22 @@ var allCommissionStates = []CommissionState{
 	CommissionVoid,
 }
 
-// AllCommissionStates 返回全部佣金状态的副本。
+// AllCommissionStates returns a copy of all commission states.
 //
-// 返回副本而不是内部切片：调用方若拿到内部切片并修改，会破坏状态机的
-// 单一事实来源。
+// It returns a copy rather than the internal slice: a caller that took the
+// internal slice and modified it would break the state machine's single source
+// of truth.
 func AllCommissionStates() []CommissionState {
 	out := make([]CommissionState, len(allCommissionStates))
 	copy(out, allCommissionStates)
 	return out
 }
 
-// CanTransitionCommission 报告 from → to 是否为合法迁移。
+// CanTransitionCommission reports whether from → to is a legal transition.
 //
-// 同状态「迁移」到自身永远为 false：状态推进必须是真实推进，
-// 否则重复投递会被误认为迁移成功而重复记账。
+// A transition from a state to itself is always false: state advancement must
+// be real advancement, otherwise a duplicate delivery would be mistaken for a
+// successful transition and booked twice.
 func CanTransitionCommission(from, to CommissionState) bool {
 	if !from.Valid() || !to.Valid() {
 		return false
@@ -73,7 +90,8 @@ func CanTransitionCommission(from, to CommissionState) bool {
 	return false
 }
 
-// ValidateCommissionTransition 在非法迁移时返回 *TransitionError。
+// ValidateCommissionTransition returns *TransitionError on an illegal
+// transition.
 func ValidateCommissionTransition(from, to CommissionState) error {
 	if !from.Valid() {
 		return fieldErrf("state", "unknown commission state %d", uint8(from))

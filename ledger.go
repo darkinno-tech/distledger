@@ -9,31 +9,36 @@ import (
 	"time"
 )
 
-// Config 是构造 Ledger 所需的依赖。
+// Config is the set of dependencies needed to construct a Ledger.
 //
-// 它刻意没有「默认全局实例」这种形态：本库不提供任何包级单例，
-// 一切依赖显式传入（见 ADR-012）。
+// It deliberately has no "default global instance" form: this library ships
+// no package-level singletons, and every dependency is passed in explicitly
+// (see ADR-012).
 type Config struct {
-	// Store 是持久化实现，必填。
+	// Store is the persistence implementation. Required.
 	Store Store
-	// Rules 是业务规则。留空时使用 DefaultRules()。
+	// Rules holds the business rules. Defaults to DefaultRules() when empty.
 	Rules Rules
-	// Clock 是时间源。留空时使用 SystemClock()。
+	// Clock is the time source. Defaults to SystemClock() when empty.
 	//
-	// 库内部不会直接调用 time.Now()，因此测试可以用 ManualClock 把
-	// 冻结期瞬间推进，不需要 sleep。
+	// The library never calls time.Now() directly, so a test can use
+	// ManualClock to jump the freeze window forward instantly without
+	// sleeping.
 	Clock Clock
-	// Logger 是日志出口。留空时丢弃全部日志。
+	// Logger is the log sink. When empty, all logs are discarded.
 	Logger *slog.Logger
-	// RateResolver 决定各层级费率。留空时使用「个体覆盖 > 全局规则」的默认实现。
+	// RateResolver decides the rate of each level. Defaults to the
+	// "per-agent override > global rules" implementation when empty.
 	RateResolver RateResolver
-	// Eligibility 决定分销员是否有资格获得佣金。留空时要求状态为 AgentActive。
+	// Eligibility decides whether an agent is eligible for a commission.
+	// When empty, the agent is required to be in AgentActive state.
 	Eligibility EligibilityChecker
 }
 
-// Ledger 是分销账务内核的对外门面。
+// Ledger is the public facade of the distribution ledger kernel.
 //
-// 它是并发安全的：所有状态都在 Store 内，Ledger 自身只持有不可变的配置。
+// It is safe for concurrent use: all state lives in the Store, and the Ledger
+// itself holds only immutable configuration.
 type Ledger struct {
 	store Store
 	rules Rules
@@ -41,15 +46,16 @@ type Ledger struct {
 	log   *slog.Logger
 	rates RateResolver
 	elig  EligibilityChecker
-	// ruleVersion 是规则集的内容指纹，构造时算一次，避免在每个热路径上
-	// 重复做 SHA-256。
+	// ruleVersion is the content fingerprint of the rule set, computed once at
+	// construction so that the hot paths do not recompute the SHA-256.
 	ruleVersion int64
 }
 
-// New 构造一个 Ledger。
+// New constructs a Ledger.
 //
-// 配置不自洽时返回错误而不是「尽力而为」：带着错误规则跑起来的结果是
-// 发出错误的钱，而那不可撤销。
+// It returns an error rather than proceeding best-effort when the
+// configuration is not self-consistent: running with broken rules pays out the
+// wrong money, and that cannot be undone.
 func New(cfg Config) (*Ledger, error) {
 	if cfg.Store == nil {
 		return nil, fieldErr("store", "must not be nil")
@@ -88,25 +94,28 @@ func New(cfg Config) (*Ledger, error) {
 	}, nil
 }
 
-// Rules 返回构造时生效的规则副本。
+// Rules returns a copy of the rules in effect at construction.
 func (l *Ledger) Rules() Rules {
 	out := l.rules
 	out.RateBP = append([]Rate(nil), l.rules.RateBP...)
 	return out
 }
 
-// Now 返回账务内核当前使用的时间。
+// Now returns the time currently used by the ledger kernel.
 func (l *Ledger) Now() time.Time { return l.clock.Now() }
 
-// ── 关系链 ──────────────────────────────────────────────────────────────
+// ── Relation chain ───────────────────────────────────────────────────
 
-// BindAgent 登记或更新一个分销员。
+// BindAgent registers or updates a agent.
 //
-// # 上级不可悄悄变更
+// # The parent cannot change quietly
 //
-// 若该分销员已存在且请求中的 ParentID 与现有值不同，返回 ErrParentAlreadySet。
-// 擅自改上级会无声地重写整个下级树的归属与历史收益，因此本方法拒绝执行；
-// 显式的换绑是另一个动作，会在后续版本以独立 API 提供（见 ADR-006）。
+// If the agent already exists and ParentID in the request differs from
+// the stored value, ErrParentAlreadySet is returned. Changing a parent on a
+// whim silently rewrites the attribution and the historical earnings of the
+// whole downstream tree, so this method refuses to do it; an explicit rebind
+// is a separate action, to be offered by a dedicated API in a later version
+// (see ADR-006).
 func (l *Ledger) BindAgent(ctx context.Context, req BindAgentRequest) (Agent, error) {
 	if req.TenantID < 0 {
 		return Agent{}, fieldErrf("tenant_id", "must be >= 0, got %d", req.TenantID)
@@ -181,12 +190,16 @@ func (l *Ledger) BindAgent(ctx context.Context, req BindAgentRequest) (Agent, er
 	return out, nil
 }
 
-// resolveDepth 计算新分销员的层级深度，并顺带完成两项安全检查。
+// resolveDepth computes the depth of a new agent and performs two safety
+// checks along the way.
 //
-//   - 环检测：沿上级链向上走，若遇到自己或遇到重复节点即为环。
-//   - 深度上限：超过 MaxLevels 直接拒绝，避免出现「配不出费率」的层级。
+//   - Cycle detection: walk up the parent chain; reaching the agent itself or
+//     a repeated node means there is a cycle.
+//   - Depth ceiling: anything past MaxLevels is rejected outright, so that no
+//     level exists for which no rate can be resolved.
 //
-// 因为 MaxLevels 只有 3，这个循环最多走 3 次，代价可忽略。
+// Because MaxLevels is only 3, the loop runs at most 3 times, so the cost is
+// negligible.
 func (l *Ledger) resolveDepth(ctx context.Context, r Reader, key UserKey, parentID int64) (int, error) {
 	depth := 1
 	cur := parentID
@@ -217,15 +230,20 @@ func (l *Ledger) resolveDepth(ctx context.Context, r Reader, key UserKey, parent
 	return depth, nil
 }
 
-// BindBuyer 建立「买家 → 分销员」的归因关系。
+// BindBuyer creates the "buyer -> agent" attribution relationship.
 //
-// # 归因规则（v0.1）
+// # Attribution rules (v0.1)
 //
-//   - 首次绑定优先：只要现有绑定在 BoundAt 时刻仍然有效，就不覆盖。
-//   - 绑定到不同的分销员时返回 ErrBindingLocked，同时返回现有绑定。
-//   - 现有绑定已过期或已失效时允许重新绑定，并记录 ReboundFrom。
+//   - First binding wins: as long as the existing binding is still effective
+//     at BoundAt, it is not overwritten.
+//   - Binding to a different agent returns ErrBindingLocked together
+//     with the existing binding.
+//   - An existing binding that has expired or been deactivated may be rebound,
+//     with ReboundFrom recorded.
 //
-// 换绑冷静期、客户保护期等策略属于规则层，会在后续版本以策略接口形式提供。
+// Policies such as a rebind cooling-off period or a customer protection window
+// belong to the rules layer and will be offered as a policy interface in a
+// later version.
 func (l *Ledger) BindBuyer(ctx context.Context, req BindBuyerRequest) (Binding, error) {
 	buyer := UserKey{TenantID: req.TenantID, UserID: req.BuyerUserID}
 	if err := buyer.Validate(); err != nil {
@@ -263,7 +281,8 @@ func (l *Ledger) BindBuyer(ctx context.Context, req BindBuyerRequest) (Binding, 
 			}
 			return err
 		}
-		// 绑定到一个未生效或被禁用的分销员没有意义，而且会污染归因数据。
+		// Binding to an inactive or disabled agent is meaningless and
+		// would pollute the attribution data.
 		if agent.Status != AgentActive {
 			return fieldErrf("agent_user_id",
 				"agent %d is not active (status=%s)", agentID, agent.Status)
@@ -282,7 +301,9 @@ func (l *Ledger) BindBuyer(ctx context.Context, req BindBuyerRequest) (Binding, 
 				}
 				return nil
 			}
-			// 旧绑定已失效：允许重新绑定，并记录来源，便于审计换绑历史。
+			// The old binding is no longer effective: rebinding is allowed,
+			// and the source is recorded so that rebind history can be
+			// audited.
 			cur.AgentUserID = agentID
 			cur.Source = req.Source
 			cur.SourceRef = req.SourceRef
@@ -331,9 +352,10 @@ func (l *Ledger) expiryFor(boundAt time.Time) time.Time {
 	return boundAt.AddDate(0, 0, l.rules.BindExpireDays)
 }
 
-// ── 查询 ────────────────────────────────────────────────────────────────
+// ── Queries ──────────────────────────────────────────────────────────
 
-// Balance 返回用户的账户余额。从未产生过资金变动的用户返回零值账户。
+// Balance returns the account balance of a user. A user whose money never
+// moved returns a zero-valued account.
 func (l *Ledger) Balance(ctx context.Context, tenantID, userID int64) (Account, error) {
 	key := UserKey{TenantID: tenantID, UserID: userID}
 	if err := key.Validate(); err != nil {
@@ -348,7 +370,7 @@ func (l *Ledger) Balance(ctx context.Context, tenantID, userID int64) (Account, 
 	return acct, err
 }
 
-// Agent 返回分销员信息。
+// Agent returns agent information.
 func (l *Ledger) Agent(ctx context.Context, tenantID, userID int64) (Agent, error) {
 	key := UserKey{TenantID: tenantID, UserID: userID}
 	if err := key.Validate(); err != nil {
@@ -363,7 +385,8 @@ func (l *Ledger) Agent(ctx context.Context, tenantID, userID int64) (Agent, erro
 	return out, err
 }
 
-// CommissionsByOrder 返回某订单产生的全部佣金（含各级）。
+// CommissionsByOrder returns every commission one order produced, at all
+// levels.
 func (l *Ledger) CommissionsByOrder(ctx context.Context, tenantID int64, orderID string) ([]Commission, error) {
 	key := OrderKey{TenantID: tenantID, OrderID: orderID}
 	if err := key.Validate(); err != nil {
@@ -378,7 +401,7 @@ func (l *Ledger) CommissionsByOrder(ctx context.Context, tenantID int64, orderID
 	return out, err
 }
 
-// CommissionsByAgent 分页返回某分销员的佣金。
+// CommissionsByAgent returns one agent's commissions, paginated.
 func (l *Ledger) CommissionsByAgent(ctx context.Context, tenantID, userID int64, q CommissionQuery) ([]Commission, error) {
 	key := UserKey{TenantID: tenantID, UserID: userID}
 	if err := key.Validate(); err != nil {
@@ -393,7 +416,7 @@ func (l *Ledger) CommissionsByAgent(ctx context.Context, tenantID, userID int64,
 	return out, err
 }
 
-// LedgerEntries 分页返回某用户的资金流水。
+// LedgerEntries returns one user's ledger entries, paginated.
 func (l *Ledger) LedgerEntries(ctx context.Context, tenantID, userID int64, q LedgerQuery) ([]LedgerEntry, error) {
 	key := UserKey{TenantID: tenantID, UserID: userID}
 	if err := key.Validate(); err != nil {
@@ -408,5 +431,5 @@ func (l *Ledger) LedgerEntries(ctx context.Context, tenantID, userID int64, q Le
 	return out, err
 }
 
-// Close 关闭底层 Store。
+// Close closes the underlying Store.
 func (l *Ledger) Close() error { return l.store.Close() }

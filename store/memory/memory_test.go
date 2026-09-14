@@ -10,12 +10,15 @@ import (
 	"github.com/im10furry/distledger"
 )
 
-// 本文件是内存 Store 的**内部**测试：它会直接检查 pendingDue 这类派生索引。
+// This file holds **internal** tests for the in-memory Store: it inspects
+// derived indexes such as pendingDue directly.
 //
-// 为什么必须检查索引本身而不是只看行为：读取路径带「新鲜度校验」，会把
-// 失效的索引项静默跳过。这保护了正确性，但也意味着索引错位不会表现为
-// 错误结果——它只会表现为越来越慢。回滚逻辑一旦写错，问题会以性能事故
-// 的形式在几个月后出现，那时几乎无法归因。
+// Why the index itself has to be checked instead of only the behaviour: the
+// read path performs a freshness check and silently skips stale index
+// entries. That protects correctness, but it also means index misalignment
+// never shows up as a wrong result -- only as something that keeps getting
+// slower. Get the rollback wrong and the problem surfaces months later as a
+// performance incident, when it is nearly impossible to attribute.
 
 func newStore(t *testing.T) *Store {
 	t.Helper()
@@ -87,7 +90,8 @@ func TestPutAgentOptimisticLock(t *testing.T) {
 	ctx := context.Background()
 	agent := seedAgent(t, s, 1) // Version == 1
 
-	// 带着「我以为它还不存在」的版本号写入必须失败。
+	// Writing with a version that says "I thought it did not exist yet" must
+	// fail.
 	stale := agent
 	stale.Version = 0
 	err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
@@ -98,27 +102,28 @@ func TestPutAgentOptimisticLock(t *testing.T) {
 		t.Fatalf("expected ErrConflict on stale version, got %v", err)
 	}
 
-	// 用真正陈旧的副本（版本落后于存储）写入也必须失败。
+	// Writing with a genuinely stale copy (version behind the store) must also
+	// fail.
 	if err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
 		cur, err := tx.Agent(ctx, agentKey(1))
 		if err != nil {
 			return err
 		}
 		cur.Status = distledger.AgentDisabled
-		_, err = tx.PutAgent(ctx, cur) // 存储版本变为 2
+		_, err = tx.PutAgent(ctx, cur) // stored version becomes 2
 		return err
 	}); err != nil {
 		t.Fatalf("update with fresh version failed: %v", err)
 	}
 	err = s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
-		_, err := tx.PutAgent(ctx, agent) // 仍然带着 Version 1
+		_, err := tx.PutAgent(ctx, agent) // still carrying Version 1
 		return err
 	})
 	if !errors.Is(err, distledger.ErrConflict) {
 		t.Fatalf("expected ErrConflict when writing an outdated copy, got %v", err)
 	}
 
-	// 用正确版本重新写入应当成功。
+	// Writing again with the correct version must succeed.
 	err = s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
 		cur, err := tx.Agent(ctx, agentKey(1))
 		if err != nil {
@@ -140,7 +145,7 @@ func TestPutAgentOptimisticLock(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// 三次成功的写入：创建(1) → 停用(2) → 重新启用(3)。
+	// Three successful writes: create (1) -> disable (2) -> re-enable (3).
 	if got.Status != distledger.AgentActive || got.Version != 3 {
 		t.Fatalf("unexpected agent after updates: %+v", got)
 	}
@@ -167,7 +172,7 @@ func TestAppendCommissionRejectsDuplicateIdemKey(t *testing.T) {
 	err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
 		_, err := tx.AppendCommission(ctx, distledger.Commission{
 			Key:         distledger.OrderKey{TenantID: 0, OrderID: "ORD-1"},
-			IdemKey:     "idem-ORD-1", // 与已存在的完全相同
+			IdemKey:     "idem-ORD-1", // exactly the same as the existing one
 			AgentUserID: 1, Layer: 1, BaseAmount: 10000, Rate: 500, Amount: 500,
 			State: distledger.CommissionPending,
 		})
@@ -194,7 +199,7 @@ func TestIdemKeyIsScopedPerTenant(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 
-	// 不同租户可以合法地使用相同的幂等键字符串。
+	// Different tenants may legitimately use the same idempotency key string.
 	for _, tn := range []int64{1, 2} {
 		if err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
 			_, err := tx.AppendCommission(ctx, distledger.Commission{
@@ -210,7 +215,7 @@ func TestIdemKeyIsScopedPerTenant(t *testing.T) {
 	}
 }
 
-// ── 回滚 ────────────────────────────────────────────────────────────────
+// ── Rollback ────────────────────────────────────────────────────────────
 
 func TestRollbackRestoresEveryEntityKind(t *testing.T) {
 	s := newStore(t)
@@ -286,10 +291,13 @@ func TestRollbackRestoresEveryEntityKind(t *testing.T) {
 	}
 }
 
-// TestRollbackFreesIdemKey 保证回滚后同一个幂等键可以再次使用。
+// TestRollbackFreesIdemKey guarantees that after a rollback the same
+// idempotency key can be used again.
 //
-// 如果回滚没有清理幂等索引，一次失败的事务会让那笔业务**永久无法入账**：
-// 后续重试全部被判为「重复」而静默丢弃。这是一个极其隐蔽的丢钱方式。
+// If the rollback did not clean up the idempotency index, one failed
+// transaction would make that piece of business **permanently unpostable**:
+// every later retry is judged a duplicate and silently dropped. That is an
+// exceptionally subtle way to lose money.
 func TestRollbackFreesIdemKey(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
@@ -309,7 +317,7 @@ func TestRollbackFreesIdemKey(t *testing.T) {
 		t.Fatal("expected the transaction to fail")
 	}
 
-	// 重试必须成功，而不是被判为重复。
+	// The retry must succeed rather than being judged a duplicate.
 	var out distledger.Commission
 	if err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
 		var err error
@@ -328,17 +336,20 @@ func TestRollbackFreesIdemKey(t *testing.T) {
 	}
 }
 
-// TestRollbackRestoresDueIndexAfterMiddleInsert 是本文件里最关键的测试。
+// TestRollbackRestoresDueIndexAfterMiddleInsert is the most critical test in
+// this file.
 //
-// pendingDue 按 (到期时间, ID) 有序。当新到的佣金到期时间早于已有条目时，
-// 插入发生在中间，元素会被搬移。此时「按长度截断」的回滚方式会恢复出
-// 错位的内容。本测试通过直接比对索引快照来捕捉这类错误。
+// pendingDue is ordered by (due time, ID). When a newly arriving commission
+// is due earlier than an existing entry, the insert lands in the middle and
+// elements get moved. A rollback that "truncates by length" then restores
+// misaligned content. This test catches exactly that class of mistake by
+// comparing index snapshots directly.
 func TestRollbackRestoresDueIndexAfterMiddleInsert(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	// 先放两个到期时间较晚的条目。
+	// First place two entries with later due times.
 	late1 := seedCommission(t, s, "LATE-1", 1)
 	late2 := seedCommission(t, s, "LATE-2", 1)
 	setAvailable := func(id int64, version int64, at time.Time) {
@@ -358,7 +369,7 @@ func TestRollbackRestoresDueIndexAfterMiddleInsert(t *testing.T) {
 		t.Fatalf("index has %d entries, want 2", len(before))
 	}
 
-	// 现在做一次「中间插入 + 失败」的事务。
+	// Now run a transaction that does a middle insert and then fails.
 	early := seedCommission(t, s, "EARLY-1", 1)
 	err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
 		if _, err := tx.SetCommissionAvailableAt(ctx, early.ID, base.Add(24*time.Hour), early.Version); err != nil {
@@ -375,7 +386,7 @@ func TestRollbackRestoresDueIndexAfterMiddleInsert(t *testing.T) {
 		t.Fatalf("due index was not restored after rollback:\n before=%v\n after =%v", before, after)
 	}
 
-	// 佣金本身的 AvailableAt 也必须回到零值。
+	// The commission's own AvailableAt must be back to its zero value as well.
 	if err := s.View(ctx, func(ctx context.Context, r distledger.Reader) error {
 		c, err := r.Commission(ctx, early.ID)
 		if err != nil {
@@ -390,8 +401,9 @@ func TestRollbackRestoresDueIndexAfterMiddleInsert(t *testing.T) {
 	}
 }
 
-// TestRollbackAfterAppendThenMiddleInsert 覆盖混合场景：
-// 同一事务里先尾部追加、再中间插入、然后失败。
+// TestRollbackAfterAppendThenMiddleInsert covers the hybrid case: within one
+// transaction the code appends at the tail, then inserts in the middle, and
+// then fails.
 func TestRollbackAfterAppendThenMiddleInsert(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
@@ -410,12 +422,12 @@ func TestRollbackAfterAppendThenMiddleInsert(t *testing.T) {
 	before := slices.Clone(s.d.pendingDue)
 
 	err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
-		// 尾部追加（到期时间最晚）。
+		// Tail append (latest due time).
 		if _, err := tx.SetCommissionAvailableAt(ctx, appended.ID,
 			base.Add(40*24*time.Hour), appended.Version); err != nil {
 			return err
 		}
-		// 中间插入（到期时间最早）。
+		// Middle insert (earliest due time).
 		if _, err := tx.SetCommissionAvailableAt(ctx, middle.ID,
 			base.Add(1*24*time.Hour), middle.Version); err != nil {
 			return err
@@ -469,7 +481,7 @@ func TestTransitionRejectsIllegalMove(t *testing.T) {
 	c := seedCommission(t, s, "ORD-1", 1)
 
 	err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
-		// Pending -> Withdrawn 是非法迁移。
+		// Pending -> Withdrawn is an illegal transition.
 		_, err := tx.TransitionCommission(ctx, c.ID,
 			distledger.CommissionPending, distledger.CommissionWithdrawn, c.Version)
 		return err
@@ -485,7 +497,7 @@ func TestTransitionReportsConflictOnWrongCurrentState(t *testing.T) {
 	c := seedCommission(t, s, "ORD-1", 1)
 
 	err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
-		// 当前状态是 Pending，却按 Settled 发起迁移。
+		// The current state is Pending, yet the transition is issued as Settled.
 		_, err := tx.TransitionCommission(ctx, c.ID,
 			distledger.CommissionSettled, distledger.CommissionWithdrawn, c.Version)
 		return err
@@ -495,7 +507,7 @@ func TestTransitionReportsConflictOnWrongCurrentState(t *testing.T) {
 	}
 }
 
-// ── 事务语义 ────────────────────────────────────────────────────────────
+// ── Transaction semantics ───────────────────────────────────────────────
 
 func TestNestedTransactionIsRejected(t *testing.T) {
 	s := newStore(t)
@@ -590,17 +602,20 @@ func TestContextCancellationIsHonoured(t *testing.T) {
 	}
 }
 
-// ── 分页 ────────────────────────────────────────────────────────────────
+// ── Pagination ──────────────────────────────────────────────────────────
 
-// TestKeysetPaginationIsStableUnderAppends 说明为什么分页用键集而不是偏移。
+// TestKeysetPaginationIsStableUnderAppends explains why pagination uses a
+// keyset rather than an offset.
 //
-// 键集分页保证的是「已存在的记录不会被跳过、也不会被读两次」。
-// 用 OFFSET 分页时，翻页途中追加的新记录会把后续窗口整体后移，
-// 于是有记录从未被读到——在对账场景里，漏读直接等于「账是平的」
-// 这个结论不成立。
+// Keyset pagination guarantees that records already present are neither
+// skipped nor read twice. With OFFSET pagination, records appended while
+// paging shift every later window, so some records are never read at all --
+// and in a reconciliation scenario a missed read directly means the
+// conclusion "the books balance" does not hold.
 //
-// 注意：键集分页**不**隐藏新追加的记录（它们的 ID 大于游标，理应被读到）。
-// 本测试断言的正是「原有的 5 条一条不漏、一条不重」。
+// Note: keyset pagination does **not** hide newly appended records (their IDs
+// exceed the cursor, so they are supposed to be read). What this test asserts
+// is precisely that the original 5 rows are neither missed nor duplicated.
 func TestKeysetPaginationIsStableUnderAppends(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
@@ -644,7 +659,7 @@ func TestKeysetPaginationIsStableUnderAppends(t *testing.T) {
 		if len(batch) == 0 {
 			break
 		}
-		// 翻页途中持续追加新数据。
+		// Keep appending new data while paging.
 		appendEntry(1)
 		for _, e := range batch {
 			seen = append(seen, e.ID)
@@ -652,14 +667,15 @@ func TestKeysetPaginationIsStableUnderAppends(t *testing.T) {
 		}
 	}
 
-	// 顺序必须严格递增：重复读与乱序都会破坏对账。
+	// The order must be strictly increasing: duplicate or out-of-order reads
+	// would break reconciliation.
 	for i := 1; i < len(seen); i++ {
 		if seen[i] <= seen[i-1] {
 			t.Fatalf("pagination returned entries out of order or duplicated: %v", seen)
 		}
 	}
 
-	// 原有 5 条必须一条不漏、一条不重。
+	// The original 5 rows must be neither missed nor duplicated.
 	counts := make(map[int64]int, len(seen))
 	for _, id := range seen {
 		counts[id]++

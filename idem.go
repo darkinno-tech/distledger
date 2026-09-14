@@ -6,33 +6,42 @@ import (
 	"encoding/hex"
 )
 
-// idemKeyVersion 参与幂等键派生。
+// idemKeyVersion participates in idempotency key derivation.
 //
-// 它必须随派生规则的变化而递增：一旦改变派生方式，已经在途的事件的幂等性
-// 会失效（同一笔业务会被认为是新业务）。把它显式写进哈希输入，是为了让
-// 这种变化至少是「有意的、可追溯的」。
+// It must be bumped whenever the derivation rules change: once the derivation
+// changes, in-flight events lose their idempotency (the same business action is
+// then seen as a new one). Writing it explicitly into the hash input makes such
+// a change at least deliberate and traceable.
 const idemKeyVersion = "v1"
 
-// 幂等键的业务命名空间。不同语义的动作使用不同命名空间，避免键碰撞。
+// Business namespaces for idempotency keys. Actions with different semantics use
+// different namespaces so that keys cannot collide.
 //
-// 这里刻意只有两个命名空间：入账与「调用方自定义」。结算、状态迁移等动作
-// 不靠幂等键去重，而是靠状态机的合法迁移 + 乐观锁版本号——它们本身就是
-// 幂等的，不需要额外的键。
+// The namespaces are per action: accrual, reversal, refund voucher and
+// caller-supplied. What is deliberately absent is a namespace for settlement or
+// state transitions - those do not dedupe through an idempotency key but through
+// legal state machine transitions plus version CAS, because they are already
+// idempotent and need no extra key.
 const (
-	nsAccrue = "accrue"
-	nsUser   = "user"
+	nsAccrue  = "accrue"
+	nsReverse = "reverse"
+	nsRefund  = "refund"
+	nsUser    = "user"
 )
 
-// idemKeyLen 是最终幂等键的十六进制长度（32 字符 = 128 位）。
+// idemKeyLen is the hex length of the final idempotency key (32 characters =
+// 128 bits).
 //
-// 128 位足够避免碰撞：即使有 10^12 条记录，碰撞概率也在 10^-15 量级。
+// 128 bits is enough to avoid collisions: even with 10^12 records the collision
+// probability is on the order of 10^-15.
 const idemKeyLen = 32
 
-// hashParts 把若干字段编码成一个无歧义的摘要。
+// hashParts encodes several fields into an unambiguous digest.
 //
-// 使用「长度前缀 + 内容」而不是分隔符拼接：如果直接用 "|" 拼接，
-// orderID="a|b" 与 orderID="a", itemID="b" 会产生相同的摘要，
-// 攻击者可以借此构造幂等键碰撞，让真实的佣金被静默丢弃。
+// It uses length-prefixed contents rather than separator concatenation: with
+// plain "|" concatenation, orderID="a|b" and orderID="a", itemID="b" would
+// produce the same digest, letting an attacker construct idempotency key
+// collisions that silently drop real commissions.
 func hashParts(parts ...string) string {
 	h := sha256.New()
 	var lenBuf [8]byte
@@ -45,14 +54,17 @@ func hashParts(parts ...string) string {
 	return hex.EncodeToString(sum[:idemKeyLen/2])
 }
 
-// accrueIdemKey 派生一笔佣金入账的幂等键。
+// accrueIdemKey derives the idempotency key for one commission accrual.
 //
-// 同一笔订单、同一个明细、同一个分销员、同一层级，永远得到同一个键。
-// 这就是「重复投递是 no-op」的全部依据（见 ADR-008）。
+// The same order, the same item, the same agent, and the same level always yield
+// the same key. That is the entire basis for "a duplicate delivery is a no-op"
+// (see ADR-008).
 //
-// override 非空时，调用方提供的键作为**种子**参与派生，而不是直接当作
-// 最终键使用：一笔订单会产生多条佣金（每个明细 × 每个层级），如果所有
-// 佣金共用同一个键，第二条起就会被判为重复而静默丢弃。
+// When override is non-empty, the caller-supplied key participates in the
+// derivation as a **seed** rather than being used as the final key: one order
+// produces several commission entries (each item x each level), and if all of
+// them shared one key, everything from the second entry onward would be judged
+// a duplicate and silently dropped.
 func accrueIdemKey(order OrderKey, itemID string, agentUserID int64, layer int, override string) string {
 	if override == "" {
 		return hashParts(
@@ -77,9 +89,48 @@ func accrueIdemKey(order OrderKey, itemID string, agentUserID int64, layer int, 
 	)
 }
 
-// validateIdemKeyOverride 校验调用方自定义幂等键。
+// reverseIdemKey derives the idempotency key for one reversal action.
 //
-// 限制字符集与长度，避免把不可控的长字符串带进唯一索引与日志。
+// The key point is that the key encodes the **cumulative value after the
+// reversal** (target), not this call's delta. That grounds idempotency in the
+// state to be reached rather than the action to be performed:
+//
+//   - Re-delivering the same refund computes the same target, so the second
+//     attempt is stopped by the unique constraint.
+//   - When two different refunds happen to land on the same cumulative value,
+//     the second one correctly becomes a no-op as well.
+//   - When the same refund is delivered concurrently, only one write succeeds
+//     and the other gets ErrDuplicate.
+//
+// With the delta as the key instead, two concurrent calls would each compute the
+// same delta, write two records, and debit the money twice.
+func reverseIdemKey(order OrderKey, itemID string, agentUserID int64, layer int, target Money) string {
+	return hashParts(
+		idemKeyVersion,
+		nsReverse,
+		i64s(order.TenantID),
+		order.OrderID,
+		itemID,
+		i64s(agentUserID),
+		i64s(int64(layer)),
+		i64s(int64(target)),
+	)
+}
+
+// refundIdemKey maps one instalment of one caller-supplied refund event to a
+// per-item key.
+//
+// The caller's key identifies the refund event; the item id makes it unique per
+// accrual item, because one refund event distributes across several items and
+// each gets its own voucher.
+func refundIdemKey(order OrderKey, itemID, callerKey string) string {
+	return hashParts(idemKeyVersion, nsRefund, i64s(order.TenantID), order.OrderID, itemID, callerKey)
+}
+
+// validateIdemKeyOverride validates a caller-supplied idempotency key.
+//
+// It restricts the character set and the length so that unbounded long strings
+// never reach a unique index or the logs.
 func validateIdemKeyOverride(raw string) error {
 	if raw == "" {
 		return fieldErr("idem_key", "must not be empty when provided")
@@ -103,7 +154,7 @@ func validateIdemKeyOverride(raw string) error {
 }
 
 func i64s(v int64) string {
-	// 手工实现以避免 fmt 在热路径上的反射开销。
+	// Implemented by hand to avoid the reflection overhead of fmt on a hot path.
 	if v == 0 {
 		return "0"
 	}

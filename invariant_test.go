@@ -11,15 +11,17 @@ import (
 	"github.com/im10furry/distledger"
 )
 
-// TestRandomEventSequencePreservesInvariants 是最重要的属性测试。
+// TestRandomEventSequencePreservesInvariants is the most important property test.
 //
-// 它用随机的事件序列（含重复投递、乱序收货、时间跳跃）去撞不变量，
-// 每轮结束后要求：
+// It hammers the invariants with random event sequences (duplicate deliveries,
+// out-of-order receipts, time jumps) and requires, after every round:
 //
-//  1. SelfCheck 全部通过（余额 == 流水和、无负余额、无悬空引用、不超配额）。
-//  2. 每条待结算佣金的账户余额与佣金之和一致。
+//  1. SelfCheck passes completely (balance == ledger sum, no negative
+//     balances, no dangling references, no cap violations).
+//  2. Each pending commission's account balance agrees with the sum of that
+//     agent's commissions.
 //
-// 失败信息里会打印随机种子，便于精确复现。
+// Failures print the random seed so they can be reproduced exactly.
 func TestRandomEventSequencePreservesInvariants(t *testing.T) {
 	const iterations = 40
 	for seed := int64(1); seed <= iterations; seed++ {
@@ -44,7 +46,7 @@ func runRandomSequence(t *testing.T, seed int64) {
 	f.mustAgent(agents[1], agents[0], distledger.AgentActive)
 	f.mustAgent(agents[2], agents[1], distledger.AgentActive)
 
-	// 8 个买家，随机归属到三个分销员之一。
+	// 8 buyers, each randomly attributed to one of the three agents.
 	const buyers = 8
 	for i := 0; i < buyers; i++ {
 		buyerID := int64(4000 + i)
@@ -52,9 +54,10 @@ func runRandomSequence(t *testing.T, seed int64) {
 	}
 
 	type orderState struct {
-		id     string
-		paid   bool
-		amount distledger.Money
+		id      string
+		paid    bool
+		amount  distledger.Money
+		buyerID int64
 	}
 	orders := make([]*orderState, 0, 16)
 	nextOrder := 0
@@ -62,16 +65,17 @@ func runRandomSequence(t *testing.T, seed int64) {
 	const ops = 220
 	for op := 0; op < ops; op++ {
 		switch rng.Intn(10) {
-		case 0, 1, 2, 3, 4: // 下单支付
+		case 0, 1, 2, 3, 4: // order paid
 			if len(orders) >= 16 {
 				continue
 			}
 			nextOrder++
-			o := &orderState{
-				id:     fmt.Sprintf("ORD-%d", nextOrder),
-				amount: distledger.Money(100 + rng.Intn(500000)),
-			}
 			buyerID := int64(4000 + rng.Intn(buyers))
+			o := &orderState{
+				id:      fmt.Sprintf("ORD-%d", nextOrder),
+				amount:  distledger.Money(100 + rng.Intn(500000)),
+				buyerID: buyerID,
+			}
 			_, err := f.led.OnOrderPaid(context.Background(), distledger.OrderPaidEvent{
 				TenantID: tenant, OrderID: o.id, BuyerUserID: buyerID,
 				PaidAmount: o.amount, PaidAt: f.clock.Now(),
@@ -82,19 +86,21 @@ func runRandomSequence(t *testing.T, seed int64) {
 			o.paid = true
 			orders = append(orders, o)
 
-		case 5: // 重复投递（应当完全无副作用）
+		case 5: // duplicate delivery (must have no side effects at all)
 			if len(orders) == 0 {
 				continue
 			}
+			// Replay the ORIGINAL buyer: the library rejects a second event
+			// for the same order that names a different buyer.
 			o := orders[rng.Intn(len(orders))]
 			if _, err := f.led.OnOrderPaid(context.Background(), distledger.OrderPaidEvent{
-				TenantID: tenant, OrderID: o.id, BuyerUserID: 4001,
+				TenantID: tenant, OrderID: o.id, BuyerUserID: o.buyerID,
 				PaidAmount: o.amount, PaidAt: f.clock.Now(),
 			}); err != nil {
 				t.Fatalf("seed=%d op=%d replay: %v", seed, op, err)
 			}
 
-		case 6, 7: // 收货（时间可以乱序）
+		case 6, 7: // receipt (timestamps may arrive out of order)
 			if len(orders) == 0 {
 				continue
 			}
@@ -106,20 +112,20 @@ func runRandomSequence(t *testing.T, seed int64) {
 				t.Fatalf("seed=%d op=%d OnOrderReceived: %v", seed, op, err)
 			}
 
-		case 8: // 推进时间
+		case 8: // advance time
 			f.clock.Advance(time.Duration(rng.Intn(96)) * time.Hour)
 
-		case 9: // 心跳
-			if _, err := f.led.Maintain(context.Background(), f.clock.Now()); err != nil {
+		case 9: // heartbeat
+			if _, err := f.led.Maintain(context.Background()); err != nil {
 				t.Fatalf("seed=%d op=%d Maintain: %v", seed, op, err)
 			}
 		}
 	}
 
-	// 收尾：推进足够久并把所有到期佣金结清。
+	// Wrap up: advance far enough and settle every matured commission.
 	f.clock.Advance(400 * 24 * time.Hour)
 	for i := 0; i < 10; i++ {
-		res, err := f.led.Maintain(context.Background(), f.clock.Now())
+		res, err := f.led.Maintain(context.Background())
 		if err != nil {
 			t.Fatalf("seed=%d final Maintain: %v", seed, err)
 		}
@@ -136,8 +142,9 @@ func runRandomSequence(t *testing.T, seed int64) {
 		t.Fatalf("seed=%d invariants violated: %+v", seed, rep.Invariants)
 	}
 
-	// 兜底断言：每个分销员的「待结算 + 可提现」必须等于其全部佣金之和中
-	// 尚未被冲正的部分。v0.1 没有冲正，因此应当完全相等。
+	// Backstop assertion: each agent's frozen + available buckets must
+	// equal the portion of their total commissions that has not been reversed.
+	// v0.1 has no reversals, so the two must be exactly equal.
 	for _, agentID := range agents {
 		commissions, err := f.led.CommissionsByAgent(context.Background(), tenant, agentID,
 			distledger.CommissionQuery{})
@@ -157,10 +164,11 @@ func runRandomSequence(t *testing.T, seed int64) {
 	}
 }
 
-// TestConcurrentAccrualProducesExactlyOneSet 验证并发下的幂等性。
+// TestConcurrentAccrualProducesExactlyOneSet verifies idempotency under concurrency.
 //
-// 32 个 goroutine 同时投递同一笔订单：结果必须与投递一次完全相同。
-// 这是真实场景——支付回调重试与 MQ 重投常常是并发的，而不是顺序的。
+// 32 goroutines deliver the same order at once: the result must be identical to
+// delivering it once. This is the real-world case—payment callback retries and
+// MQ redeliveries are usually concurrent, not sequential.
 func TestConcurrentAccrualProducesExactlyOneSet(t *testing.T) {
 	f := newFixture(t, twoLevelRules())
 	f.mustAgent(3001, 0, distledger.AgentActive)
@@ -218,7 +226,8 @@ func TestConcurrentAccrualProducesExactlyOneSet(t *testing.T) {
 	}
 }
 
-// TestConcurrentMaintainSettlesExactlyOnce 验证并发心跳不会重复结算。
+// TestConcurrentMaintainSettlesExactlyOnce verifies that concurrent heartbeats
+// do not settle the same commission twice.
 func TestConcurrentMaintainSettlesExactlyOnce(t *testing.T) {
 	f := newFixture(t, distledger.Rules{
 		Levels: 1, RateBP: []distledger.Rate{1000}, FreezeDays: 0,
@@ -246,7 +255,7 @@ func TestConcurrentMaintainSettlesExactlyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			res, err := f.led.Maintain(context.Background(), f.clock.Now())
+			res, err := f.led.Maintain(context.Background())
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -276,7 +285,7 @@ func TestConcurrentMaintainSettlesExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestConcurrentMixedTraffic 让支付、收货、心跳同时发生。
+// TestConcurrentMixedTraffic runs payment, receipt, and heartbeat concurrently.
 func TestConcurrentMixedTraffic(t *testing.T) {
 	f := newFixture(t, distledger.Rules{
 		Levels: 2, RateBP: []distledger.Rate{500, 300}, FreezeDays: 1,
@@ -311,7 +320,7 @@ func TestConcurrentMixedTraffic(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			_, err := f.led.Maintain(context.Background(), paidAt)
+			_, err := f.led.Maintain(context.Background())
 			errCh <- err
 		}()
 	}
@@ -323,10 +332,10 @@ func TestConcurrentMixedTraffic(t *testing.T) {
 		}
 	}
 
-	// 再次心跳把剩余到期的结清。
+	// One more heartbeat settles whatever else has matured.
 	f.clock.Advance(48 * time.Hour)
 	for i := 0; i < 5; i++ {
-		res, err := f.led.Maintain(context.Background(), f.clock.Now())
+		res, err := f.led.Maintain(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -338,5 +347,199 @@ func TestConcurrentMixedTraffic(t *testing.T) {
 	rep := f.selfCheck()
 	if !rep.OK {
 		t.Fatalf("invariants violated under mixed traffic: %+v", rep.Invariants)
+	}
+}
+
+// TestRandomRefundSequencePreservesInvariants extends the property test to the
+// refund path, which is where the money most easily goes wrong.
+//
+// Every round mixes partial refunds, whole-order refunds, full refunds,
+// duplicate deliveries of the SAME refund identifier, and genuine repeat refunds
+// with fresh identifiers. At the end the self check must pass, and each
+// agent's balance must reconcile with their commission records.
+func TestRandomRefundSequencePreservesInvariants(t *testing.T) {
+	const iterations = 25
+	for seed := int64(100); seed < 100+iterations; seed++ {
+		seed := seed
+		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
+			runRandomRefundSequence(t, seed)
+		})
+	}
+}
+
+func runRandomRefundSequence(t *testing.T, seed int64) {
+	t.Helper()
+	rng := rand.New(rand.NewSource(seed))
+
+	f := newFixture(t, distledger.Rules{
+		Levels: 3, RateBP: []distledger.Rate{500, 200, 100},
+		FreezeDays: 3, Rounding: distledger.RoundHalfUp,
+	})
+
+	agents := []int64{3001, 3002, 3003}
+	f.mustAgent(agents[0], 0, distledger.AgentActive)
+	f.mustAgent(agents[1], agents[0], distledger.AgentActive)
+	f.mustAgent(agents[2], agents[1], distledger.AgentActive)
+
+	const buyers = 4
+	for i := 0; i < buyers; i++ {
+		f.mustBuyer(int64(4000+i), agents[rng.Intn(len(agents))])
+	}
+
+	type orderState struct {
+		id       string
+		amount   distledger.Money
+		buyerID  int64
+		refunded distledger.Money
+		base     distledger.Money // order-level accrual base
+	}
+	var orders []*orderState
+	nextOrder := 0
+
+	// lastRefundID lets the same identifier be replayed deliberately.
+	lastRefundID := ""
+	refundCounter := 0
+
+	const ops = 200
+	for op := 0; op < ops; op++ {
+		switch rng.Intn(12) {
+		case 0, 1, 2, 3, 4:
+			if len(orders) >= 10 {
+				continue
+			}
+			nextOrder++
+			buyerID := int64(4000 + rng.Intn(buyers))
+			o := &orderState{
+				id:      fmt.Sprintf("ORD-%d", nextOrder),
+				amount:  distledger.Money(1000 + rng.Intn(200000)),
+				buyerID: buyerID,
+			}
+			if _, err := f.led.OnOrderPaid(context.Background(), distledger.OrderPaidEvent{
+				TenantID: tenant, OrderID: o.id, BuyerUserID: buyerID,
+				PaidAmount: o.amount, PaidAt: f.clock.Now(),
+			}); err != nil {
+				t.Fatalf("seed=%d op=%d pay: %v", seed, op, err)
+			}
+			o.base = o.amount
+			orders = append(orders, o)
+
+		case 5, 6:
+			if len(orders) == 0 {
+				continue
+			}
+			o := orders[rng.Intn(len(orders))]
+			at := f.clock.Now().Add(-time.Duration(rng.Intn(24)) * time.Hour)
+			if _, err := f.led.OnOrderReceived(context.Background(), distledger.OrderReceivedEvent{
+				TenantID: tenant, OrderID: o.id, ReceivedAt: at,
+			}); err != nil {
+				t.Fatalf("seed=%d op=%d receive: %v", seed, op, err)
+			}
+
+		case 7:
+			f.clock.Advance(time.Duration(rng.Intn(72)) * time.Hour)
+
+		case 8:
+			if _, err := f.led.Maintain(context.Background()); err != nil {
+				t.Fatalf("seed=%d op=%d maintain: %v", seed, op, err)
+			}
+
+		case 9, 10, 11:
+			if len(orders) == 0 {
+				continue
+			}
+			o := orders[rng.Intn(len(orders))]
+			remaining := o.base - o.refunded
+			if remaining <= 0 {
+				continue
+			}
+
+			// One in four refund events replays the previous identifier, which
+			// must be a no-op.
+			idem := lastRefundID
+			replay := idem != "" && rng.Intn(4) == 0
+			if !replay {
+				refundCounter++
+				idem = fmt.Sprintf("refund-%d", refundCounter)
+				lastRefundID = idem
+			}
+
+			ev := distledger.OrderRefundedEvent{
+				TenantID: tenant, OrderID: o.id, IdemKey: idem,
+				RefundedAt: f.clock.Now(),
+			}
+			switch rng.Intn(3) {
+			case 0:
+				ev.Amount = distledger.Money(1 + rng.Int63n(int64(remaining)))
+			case 1:
+				ev.Amount = remaining // exhausts the order
+			default:
+				ev.IsFull = true
+			}
+
+			if _, err := f.led.OnOrderRefunded(context.Background(), ev); err != nil {
+				t.Fatalf("seed=%d op=%d refund: %v", seed, op, err)
+			}
+			if !replay {
+				if ev.IsFull {
+					o.refunded = o.base
+				} else if next := o.refunded + ev.Amount; next > o.base {
+					o.refunded = o.base
+				} else {
+					o.refunded = next
+				}
+			}
+		}
+	}
+
+	// Drain everything.
+	f.clock.Advance(400 * 24 * time.Hour)
+	for i := 0; i < 10; i++ {
+		res, err := f.led.Maintain(context.Background())
+		if err != nil {
+			t.Fatalf("seed=%d final maintain: %v", seed, err)
+		}
+		if res.SettledCount == 0 {
+			break
+		}
+	}
+
+	rep, err := f.led.SelfCheck(context.Background(), tenant)
+	if err != nil {
+		t.Fatalf("seed=%d SelfCheck: %v", seed, err)
+	}
+	if !rep.OK {
+		t.Fatalf("seed=%d invariants violated: %+v", seed, rep.Invariants)
+	}
+
+	for _, agentID := range agents {
+		commissions, err := f.led.CommissionsByAgent(context.Background(), tenant, agentID,
+			distledger.CommissionQuery{})
+		if err != nil {
+			t.Fatalf("seed=%d CommissionsByAgent: %v", seed, err)
+		}
+		var net, reversed distledger.Money
+		for _, c := range commissions {
+			net += c.Amount
+			if c.Amount < 0 {
+				reversed += -c.Amount
+			}
+		}
+		if net < 0 {
+			t.Fatalf("seed=%d agent %d has a negative net commission total %s", seed, agentID, net)
+		}
+		bal := f.balance(agentID)
+		buckets := bal.Frozen + bal.Available + bal.Withdrawing + bal.Withdrawn
+		if buckets != net {
+			t.Fatalf("seed=%d agent %d buckets sum to %s but net commissions are %s",
+				seed, agentID, buckets, net)
+		}
+		if bal.TotalReversed != reversed {
+			t.Fatalf("seed=%d agent %d total reversed is %s but records sum to %s",
+				seed, agentID, bal.TotalReversed, reversed)
+		}
+		if bal.TotalEarned-bal.TotalReversed != net {
+			t.Fatalf("seed=%d agent %d gross-minus-reversed is %s but net is %s",
+				seed, agentID, bal.TotalEarned-bal.TotalReversed, net)
+		}
 	}
 }

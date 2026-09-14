@@ -1,34 +1,42 @@
-// Package safemath 提供金额运算所需的整数安全原语。
+// Package safemath provides the integer safety primitives needed by amount
+// arithmetic.
 //
-// 本包是整个库中唯一允许做「乘法可能溢出」运算的地方，因此它刻意做得很小、
-// 很笨、很容易被穷举验证。所有函数的契约都以「返回 ok=false 而不是 panic、
-// 不是静默回绕」为第一原则。
+// This package is the only place in the library allowed to perform
+// multiplications that may overflow, so it is deliberately small, dumb, and easy
+// to verify by exhaustive testing. Every function's contract takes "return
+// ok=false instead of panicking, and instead of silently wrapping around" as its
+// first principle.
 //
-// 设计约束（见 docs/design-decisions.md ADR-003）：
-//   - 全程使用 int64/uint64 整数，禁止任何浮点参与金额运算。
-//   - 溢出必须被显式检测并上报，绝不允许静默 wrap-around。
+// Design constraints (see docs/design-decisions.md ADR-003):
+//   - Use int64/uint64 integers throughout; no floating point in amount
+//     arithmetic.
+//   - Overflow must be detected and reported explicitly; silent wrap-around is
+//     never allowed.
 package safemath
 
 import "math/bits"
 
-// MulDiv 计算 a*b/d，其中 a、b 为非负整数，d 为正整数。
+// MulDiv computes a*b/d, where a and b are non-negative integers and d is a
+// positive integer.
 //
-// 语义：
-//   - 若 roundUp 为 true，则向上取整（ceiling）。
-//   - 否则若 halfUp 为 true，则四舍五入（half away from zero）。
-//   - 否则向零截断。
+// Semantics:
+//   - If roundUp is true, round up (ceiling).
+//   - Otherwise, if halfUp is true, round half away from zero.
+//   - Otherwise, truncate toward zero.
 //
-// 返回 ok=false 表示结果无法用 uint64 表示（溢出），调用方必须据此中止运算
-// 并返回错误，而不是使用返回值。
+// A returned ok=false means the result cannot be represented as a uint64
+// (overflow); the caller must abort the computation and return an error rather
+// than use the returned value.
 //
-// roundUp 优先于 halfUp：两者同时为 true 时按 ceiling 处理。
+// roundUp takes precedence over halfUp: with both true, the result is the
+// ceiling.
 func MulDiv(a, b, d uint64, roundUp, halfUp bool) (uint64, bool) {
 	if d == 0 {
 		return 0, false
 	}
 	hi, lo := bits.Mul64(a, b)
 	if hi >= d {
-		// 商将超出 uint64 表示范围。
+		// The quotient would exceed the uint64 range.
 		return 0, false
 	}
 	q, r := bits.Div64(hi, lo, d)
@@ -41,7 +49,7 @@ func MulDiv(a, b, d uint64, roundUp, halfUp bool) (uint64, bool) {
 		}
 		return q + 1, true
 	}
-	if halfUp && r >= d-r { // 等价于 2r >= d，且避免 2r 溢出
+	if halfUp && r >= d-r { // Equivalent to 2r >= d, avoiding an overflow in 2r.
 		if q == ^uint64(0) {
 			return 0, false
 		}
@@ -50,7 +58,7 @@ func MulDiv(a, b, d uint64, roundUp, halfUp bool) (uint64, bool) {
 	return q, true
 }
 
-// Add 检测 a+b 是否溢出。
+// Add reports whether a+b overflows.
 func Add(a, b int64) (int64, bool) {
 	s := a + b
 	if (b > 0 && s < a) || (b < 0 && s > a) {
@@ -59,12 +67,14 @@ func Add(a, b int64) (int64, bool) {
 	return s, true
 }
 
-// Sub 检测 a-b 是否溢出。
+// Sub reports whether a-b overflows.
 //
-// 判据：结果的符号变化方向必须与 -b 一致。这个判据在所有边界上都成立，
-// 包括 a 与 b 同为 MinInt64 的情形（结果为 0，是合法运算）。
-// 这里刻意不对 MinInt64 做特判：任何「保守地多报一次溢出」的特判
-// 都会把合法运算判成失败，而在金额场景里失败就等于业务中断。
+// The test: the sign of the result must change in the direction implied by -b.
+// That test holds at every boundary, including a and b both equal to MinInt64
+// (the result is 0, which is a legal operation). MinInt64 is deliberately not
+// special-cased: any special case that "conservatively reports one extra
+// overflow" would turn a legal operation into a failure, and in a money context
+// a failure means a business outage.
 func Sub(a, b int64) (int64, bool) {
 	d := a - b
 	if (b < 0 && d < a) || (b > 0 && d > a) {
@@ -73,7 +83,7 @@ func Sub(a, b int64) (int64, bool) {
 	return d, true
 }
 
-// Neg 检测取负是否溢出（minInt64 取负会溢出）。
+// Neg reports whether negation overflows (negating minInt64 overflows).
 func Neg(a int64) (int64, bool) {
 	if a == minInt64 {
 		return 0, false
@@ -83,8 +93,8 @@ func Neg(a int64) (int64, bool) {
 
 const minInt64 = -1 << 63
 
-// MaxInt64 是 int64 的最大值。
+// MaxInt64 is the maximum value of int64.
 const MaxInt64 = 1<<63 - 1
 
-// MinInt64 是 int64 的最小值。
+// MinInt64 is the minimum value of int64.
 const MinInt64 = minInt64

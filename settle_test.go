@@ -9,10 +9,11 @@ import (
 	"github.com/im10furry/distledger/store/memory"
 )
 
-// newLedgerOn 在既有 Store 上再建一个 Ledger。
+// newLedgerOn builds another Ledger on top of an existing Store.
 //
-// 它用于验证「配置变更不影响历史数据」这类契约：同一个 Store、不同的规则，
-// 历史佣金的表现必须完全一致。
+// It is used to verify contracts such as "a config change does not affect
+// historical data": under the same Store but different rules, historical
+// commissions must behave identically.
 func newLedgerOn(t *testing.T, store *memory.Store, clock distledger.Clock, rules distledger.Rules) *distledger.Ledger {
 	t.Helper()
 	led, err := distledger.New(distledger.Config{Store: store, Clock: clock, Rules: rules})
@@ -35,7 +36,7 @@ func (f *fixture) receive(orderID string, at time.Time) distledger.ReceiveResult
 
 func (f *fixture) maintain() distledger.MaintainResult {
 	f.t.Helper()
-	res, err := f.led.Maintain(context.Background(), time.Time{})
+	res, err := f.led.Maintain(context.Background())
 	if err != nil {
 		f.t.Fatalf("Maintain: %v", err)
 	}
@@ -48,12 +49,12 @@ func TestMaintainSettlesOnlyAfterFreezeElapses(t *testing.T) {
 	})
 	f.mustAgent(3001, 0, distledger.AgentActive)
 	f.mustBuyer(4001, 3001)
-	f.mustPay("ORD-1", 4001, 100000) // 佣金 100.00
+	f.mustPay("ORD-1", 4001, 100000) // commission 100.00
 
 	receivedAt := f.clock.Now()
 	f.receive("ORD-1", receivedAt)
 
-	// 冻结期未满：Maintain 什么都不做。
+	// The freeze window has not elapsed: Maintain does nothing.
 	f.clock.Advance(6 * 24 * time.Hour)
 	if res := f.maintain(); res.SettledCount != 0 {
 		t.Fatalf("settled %d commissions before the freeze elapsed", res.SettledCount)
@@ -62,7 +63,7 @@ func TestMaintainSettlesOnlyAfterFreezeElapses(t *testing.T) {
 		t.Fatalf("before freeze: frozen=%s available=%s, want 100.00/0.00", bal.Frozen, bal.Available)
 	}
 
-	// 冻结期满：结算。
+	// The freeze window has elapsed: settle.
 	f.clock.Advance(2 * 24 * time.Hour)
 	res := f.maintain()
 	if res.SettledCount != 1 {
@@ -76,17 +77,19 @@ func TestMaintainSettlesOnlyAfterFreezeElapses(t *testing.T) {
 		t.Fatalf("after freeze: frozen=%s available=%s, want 0.00/100.00", bal.Frozen, bal.Available)
 	}
 
-	// 再跑一次是幂等的。
+	// Running it a second time is idempotent.
 	if again := f.maintain(); again.SettledCount != 0 {
 		t.Fatalf("second Maintain settled %d commissions, want 0", again.SettledCount)
 	}
 }
 
-// TestFreezeDaysIsSnapshotted 是 ADR-005 的回归测试。
+// TestFreezeDaysIsSnapshotted is the regression test for ADR-005.
 //
-// 冻结期必须在入账时快照。如果改成「查询时读全局配置」，运营改一次配置
-// 就会把所有历史订单的到账时间一起改掉——已经承诺给分销员的时间被
-// 单方面推翻，且无法自证当时的规则。
+// The freeze window must be snapshotted at accrual time. If it were instead
+// read from global config at query time, one operations change would move the
+// availability date of every historical order at once—unilaterally overriding
+// the timing already promised to agents, with no way to prove which
+// rules applied back then.
 func TestFreezeDaysIsSnapshotted(t *testing.T) {
 	clock := distledger.NewManualClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	store := memory.New()
@@ -113,7 +116,7 @@ func TestFreezeDaysIsSnapshotted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 运营把冻结期从 7 天改成 30 天。
+	// Operations extends the freeze window from 7 days to 30.
 	longer := distledger.Rules{Levels: 1, RateBP: []distledger.Rate{1000}, FreezeDays: 30}
 	after := newLedgerOn(t, store, clock, longer)
 
@@ -140,9 +143,11 @@ func TestFreezeDaysIsSnapshotted(t *testing.T) {
 		t.Fatalf("available at = %s, want %s (the snapshot must win)", c.AvailableAt, want)
 	}
 
-	// 按新的 30 天配置，第 8 天不应该结算。
+	// Day 8 is the interesting point: under the new 30-day configuration the
+	// commission would still be frozen, but the snapshot taken at accrual time
+	// says 7 days, so it must settle. This is the whole point of ADR-005.
 	clock.Set(receivedAt.AddDate(0, 0, 8))
-	res, err := after.Maintain(ctx, time.Time{})
+	res, err := after.Maintain(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +156,8 @@ func TestFreezeDaysIsSnapshotted(t *testing.T) {
 	}
 }
 
-// TestReceiveIsFirstWins 防止「用重复投递把到账时间往前刷」。
+// TestReceiveIsFirstWins prevents "using duplicate deliveries to move the
+// availability date forward".
 func TestReceiveIsFirstWins(t *testing.T) {
 	f := newFixture(t, distledger.Rules{
 		Levels: 1, RateBP: []distledger.Rate{1000}, FreezeDays: 7,
@@ -160,21 +166,38 @@ func TestReceiveIsFirstWins(t *testing.T) {
 	f.mustBuyer(4001, 3001)
 	f.mustPay("ORD-1", 4001, 100000)
 
-	f.receive("ORD-1", f.clock.Now())
-
-	// 稍后有人重新投递收货事件，试图把冻结期重新开始计时（从而更早到账）。
-	f.clock.Advance(6 * 24 * time.Hour)
-	if res := f.receive("ORD-1", f.clock.Now()); res.Updated != 0 {
-		t.Fatalf("repeat receive updated %d commissions, want 0", res.Updated)
-	}
+	receivedAt := f.clock.Now()
+	f.receive("ORD-1", receivedAt)
+	want := receivedAt.AddDate(0, 0, 7)
+	// want is well in the future; the ledger clock is advanced below only to
+	// make the "earlier receipt" attack meaningful.
 
 	commissions, err := f.led.CommissionsByOrder(context.Background(), tenant, "ORD-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := f.clock.Now().AddDate(0, 0, 1) // 首次收货 + 7 天
 	if !commissions[0].AvailableAt.Equal(want) {
-		t.Fatalf("available at = %s, want the first-wins value %s", commissions[0].AvailableAt, want)
+		t.Fatalf("available at = %s, want %s", commissions[0].AvailableAt, want)
+	}
+
+	// The dangerous redelivery is not a later one - a later receipt would push
+	// availability further out, which hurts nobody. The one worth defending
+	// against carries an EARLIER receipt time, because that is what pulls the
+	// payout forward. First-wins must reject it even though the date it would
+	// set is perfectly plausible on its own.
+	f.clock.Advance(6 * 24 * time.Hour)
+	backdated := receivedAt.Add(-30 * 24 * time.Hour)
+	if res := f.receive("ORD-1", backdated); res.Updated != 0 {
+		t.Fatalf("a backdated repeat receipt updated %d commissions, want 0", res.Updated)
+	}
+
+	commissions, err = f.led.CommissionsByOrder(context.Background(), tenant, "ORD-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !commissions[0].AvailableAt.Equal(want) {
+		t.Fatalf("available at = %s, want it pinned at the first-wins value %s",
+			commissions[0].AvailableAt, want)
 	}
 }
 
@@ -217,8 +240,9 @@ func TestSettleWritesLedgerWithCorrectBalances(t *testing.T) {
 	}
 }
 
-// TestSettleNeverMakesBalanceNegative 验证「先结算、再记账」的失败安全：
-// 即使账户里的待结算余额不足以覆盖佣金，也绝不能变成负数。
+// TestSettleNeverMakesBalanceNegative verifies the fail-safe behind "settle
+// first, record second": even when the account's frozen balance cannot cover a
+// commission, the balance must never go negative.
 func TestSettleNeverMakesBalanceNegative(t *testing.T) {
 	f := newFixture(t, distledger.Rules{
 		Levels: 1, RateBP: []distledger.Rate{1000}, FreezeDays: 0,
@@ -228,7 +252,8 @@ func TestSettleNeverMakesBalanceNegative(t *testing.T) {
 	f.mustPay("ORD-1", 4001, 100000)
 	f.receive("ORD-1", f.clock.Now())
 
-	// 人为把账户的待结算余额清零，制造「佣金存在但钱不在」的破坏状态。
+	// Force the account's frozen balance to zero, manufacturing the corrupt
+	// state where the commission exists but the money does not.
 	ctx := context.Background()
 	if err := f.store.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
 		acct, err := tx.Account(ctx, distledger.UserKey{TenantID: tenant, UserID: 3001})
@@ -243,7 +268,7 @@ func TestSettleNeverMakesBalanceNegative(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := f.led.Maintain(ctx, time.Time{}); err == nil {
+	if _, err := f.led.Maintain(ctx); err == nil {
 		t.Fatal("Maintain must fail loudly when the frozen balance cannot cover a commission")
 	}
 
@@ -287,7 +312,7 @@ func TestMaintainAcrossMultipleTenants(t *testing.T) {
 		}
 	}
 
-	res, err := led.Maintain(ctx, time.Time{})
+	res, err := led.Maintain(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +320,7 @@ func TestMaintainAcrossMultipleTenants(t *testing.T) {
 		t.Fatalf("settled %d commissions, want 3 (one per tenant)", res.SettledCount)
 	}
 
-	// 跨租户不能串数据。
+	// Tenants must not leak data across each other.
 	for _, tn := range []int64{1, 2, 3} {
 		bal, err := led.Balance(ctx, tn, 3001)
 		if err != nil {

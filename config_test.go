@@ -20,7 +20,7 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 	t.Run("invalid rules", func(t *testing.T) {
 		_, err := distledger.New(distledger.Config{
 			Store: memory.New(),
-			Rules: distledger.Rules{Levels: 2, RateBP: []distledger.Rate{1}}, // 长度与层级不符
+			Rules: distledger.Rules{Levels: 2, RateBP: []distledger.Rate{1}}, // count != Levels
 		})
 		if !errors.Is(err, distledger.ErrInvalidConfig) {
 			t.Fatalf("expected ErrInvalidConfig, got %v", err)
@@ -75,7 +75,8 @@ func TestNewAppliesSafeDefaults(t *testing.T) {
 	}
 }
 
-// TestRulesCopyIsIsolated 保证调用方拿到的规则副本不会反向污染内核。
+// TestRulesCopyIsIsolated keeps the rules copy handed to a caller from
+// leaking back into the kernel.
 func TestRulesCopyIsIsolated(t *testing.T) {
 	led, err := distledger.New(distledger.Config{
 		Store: memory.New(),
@@ -162,10 +163,11 @@ func TestQueryAccessorsValidateInput(t *testing.T) {
 	}
 }
 
-// TestRulesAreFrozenPerLedger 验证规则在构造时冻结。
+// TestRulesAreFrozenPerLedger verifies that rules are frozen at construction.
 //
-// 这避免了一个很隐蔽的坑：如果规则可以在运行期改，那么「同一天的订单
-// 用了不同费率」就无法解释，也无法复现。
+// This avoids a subtle trap: if rules could be changed while the ledger runs,
+// "orders from the same day were charged different rates" would be neither
+// explainable nor reproducible.
 func TestRulesAreFrozenPerLedger(t *testing.T) {
 	f := newFixture(t, distledger.Rules{
 		Levels: 1, RateBP: []distledger.Rate{1000}, FreezeDays: 7,
@@ -180,7 +182,7 @@ func TestRulesAreFrozenPerLedger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 两笔订单必须用同一版规则，因此 RuleVersion 相同。
+	// Both orders must use the same rule version, so RuleVersion matches.
 	first, err := f.led.CommissionsByOrder(context.Background(), tenant, "ORD-1")
 	if err != nil {
 		t.Fatal(err)

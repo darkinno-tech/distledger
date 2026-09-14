@@ -42,8 +42,8 @@ func TestMoneyApplyRounding(t *testing.T) {
 	}
 }
 
-// TestMoneyApplyNeverAmplifies 验证一个关键安全属性：
-// 合法费率（≤100%）永远不会把金额放大，因此 Apply 不可能因为结果过大而溢出。
+// TestMoneyApplyNeverAmplifies pins a key safety property: a legal rate
+// (100% or less) never amplifies the amount, so Apply cannot overflow.
 func TestMoneyApplyNeverAmplifies(t *testing.T) {
 	amounts := []Money{0, 1, -1, 99, 100, 101, 19900, -19900, 1 << 40, -(1 << 40), math.MaxInt64, math.MinInt64 + 1}
 	rates := []Rate{0, 1, 5, 100, 500, 9999, 10000}
@@ -67,7 +67,7 @@ func TestMoneyApplyNeverAmplifies(t *testing.T) {
 func abs64(v int64) int64 {
 	if v < 0 {
 		if v == math.MinInt64 {
-			return math.MaxInt64 // 饱和即可，仅用于比较量级
+			return math.MaxInt64 // saturating is enough; only magnitudes are compared
 		}
 		return -v
 	}
@@ -164,7 +164,7 @@ func TestMoneyJSONRoundTrip(t *testing.T) {
 		t.Fatalf("marshal produced %s", out)
 	}
 
-	// 整数 number 也接受。
+	// An integer JSON number is accepted as well.
 	var p2 payload
 	if err := json.Unmarshal([]byte(`{"amount":19900}`), &p2); err != nil {
 		t.Fatalf("unmarshal int: %v", err)
@@ -173,7 +173,7 @@ func TestMoneyJSONRoundTrip(t *testing.T) {
 		t.Fatalf("got %d, want 19900", p2.Amount)
 	}
 
-	// 小数 number 必须被拒绝：它意味着调用方在用浮点表达金额。
+	// A fractional number must be rejected: it means money was sent as a float.
 	var p3 payload
 	if err := json.Unmarshal([]byte(`{"amount":199.5}`), &p3); err == nil {
 		t.Fatal("float JSON number must be rejected to protect precision")
@@ -202,7 +202,7 @@ func TestParseMoney(t *testing.T) {
 		}
 	}
 
-	// 超过两位小数必须报错而不是静默截断：静默丢钱比报错危险得多。
+	// More than two decimals must fail, not truncate silently: quiet loss is worse.
 	for _, bad := range []string{"", "abc", "1.234", "1.", ".", "1..2", "1e3", "--1", "1,000"} {
 		if _, err := ParseMoney(bad); err == nil {
 			t.Fatalf("ParseMoney(%q) should have failed", bad)

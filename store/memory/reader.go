@@ -9,7 +9,8 @@ import (
 	"github.com/im10furry/distledger"
 )
 
-// reader 是只读句柄。调用方持有它时必须已经持有 Store 的读锁或写锁。
+// reader is the read-only handle. The caller must already hold either the read
+// or the write lock of the owning Store.
 type reader struct{ d *data }
 
 var _ distledger.Reader = (*reader)(nil)
@@ -40,8 +41,9 @@ func (r *reader) Account(ctx context.Context, key distledger.UserKey) (distledge
 	if err := ctx.Err(); err != nil {
 		return distledger.Account{}, err
 	}
-	// 账户不存在不是错误：从未产生过资金变动的用户，其账户就是零值账户。
-	// 把「零余额」和「账户不存在」区分开，只会让调用方多写一个分支。
+	// A missing account is not an error: a user who has never moved money
+	// simply has the zero account. Distinguishing "zero balance" from "no
+	// account" would only force every caller to write another branch.
 	return r.d.accounts[key], nil
 }
 
@@ -78,7 +80,8 @@ func (r *reader) CommissionsByAgent(ctx context.Context, key distledger.UserKey,
 	limit := q.Page.LimitOrDefault()
 	out := make([]distledger.Commission, 0, minInt(limit, len(ids)))
 	for _, id := range ids {
-		// byAgent 按 ID 升序追加，因此可以直接跳过键集锚点之前的部分。
+		// byAgent is appended in ascending id order, so the keyset anchor can
+		// be skipped directly.
 		if id <= q.Page.AfterID {
 			continue
 		}
@@ -97,17 +100,28 @@ func (r *reader) CommissionsByAgent(ctx context.Context, key distledger.UserKey,
 	return out, nil
 }
 
-// DueCommissions 返回已到可结算时点、且仍处于待结算状态的佣金。
-//
-// 实现要点：pendingDue 按 (at, id) 升序，因此「第一个 at > dueAt 的下标」
-// 之前的全部条目构成候选集。二分定位后只扫描候选集，不扫描全表。
+func (r *reader) RefundsByOrder(ctx context.Context, key distledger.OrderKey) ([]distledger.Refund, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ids := r.d.refundsByOrder[key]
+	out := make([]distledger.Refund, 0, len(ids))
+	for _, id := range ids {
+		if refund, ok := r.d.refunds[id]; ok {
+			out = append(out, refund)
+		}
+	}
+	return out, nil
+}
+
 func (r *reader) CommissionsByTenant(ctx context.Context, tenantID int64, p distledger.Page) ([]distledger.Commission, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	limit := p.LimitOrDefault()
 	ids := r.d.commissionIDs
-	// commissionIDs 升序，二分找到第一个大于锚点的位置。
+	// commissionIDs is ascending, so a binary search finds the first entry past
+	// the keyset anchor.
 	start := sort.Search(len(ids), func(i int) bool { return ids[i] > p.AfterID })
 	out := make([]distledger.Commission, 0, minInt(limit, len(ids)-start))
 	for i := start; i < len(ids) && len(out) < limit; i++ {
@@ -120,6 +134,14 @@ func (r *reader) CommissionsByTenant(ctx context.Context, tenantID int64, p dist
 	return out, nil
 }
 
+// DueCommissions returns pending commissions whose settlement time has arrived.
+//
+// The implementation matters here: pendingDue is sorted by (tenant, at, id), so
+// one tenant's slice is a contiguous range found by two binary searches. Only
+// that range is scanned. Filtering by tenant AFTER a global scan - which is what
+// a naive implementation does - would make every tenant's heartbeat linear in
+// the installation-wide backlog, and would quietly break the O(log n + limit)
+// promise the port makes.
 func (r *reader) DueCommissions(ctx context.Context, tenantID int64, dueAt time.Time, limit int) ([]distledger.Commission, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -128,21 +150,24 @@ func (r *reader) DueCommissions(ctx context.Context, tenantID int64, dueAt time.
 		limit = distledger.DefaultPageLimit
 	}
 	idx := r.d.pendingDue
-	hi := sort.Search(len(idx), func(i int) bool { return idx[i].at.After(dueAt) })
-	out := make([]distledger.Commission, 0, minInt(limit, hi))
-	for i := 0; i < hi; i++ {
+
+	lo := sort.Search(len(idx), func(i int) bool { return idx[i].tenantID >= tenantID })
+	hi := lo + sort.Search(len(idx)-lo, func(i int) bool {
+		e := idx[lo+i]
+		return e.tenantID != tenantID || e.at.After(dueAt)
+	})
+
+	out := make([]distledger.Commission, 0, minInt(limit, hi-lo))
+	for i := lo; i < hi; i++ {
 		ref := idx[i]
 		c, ok := r.d.commissions[ref.id]
 		if !ok {
 			continue
 		}
-		// 新鲜度校验：索引项必须与佣金当前状态完全一致才被采信。
-		// 这让索引可以在状态变化时被「惰性失效」，而不必在每次状态
-		// 变化时都付出删除代价。
+		// Freshness check: the index entry is only trusted when it agrees with
+		// the commission's current state. That lets stale entries be invalidated
+		// lazily instead of paying for a delete on every state change.
 		if c.State != distledger.CommissionPending || !c.AvailableAt.Equal(ref.at) {
-			continue
-		}
-		if c.Key.TenantID != tenantID {
 			continue
 		}
 		out = append(out, c)
@@ -165,21 +190,24 @@ func (r *reader) AccountsByTenant(ctx context.Context, tenantID int64, p distled
 		return nil, err
 	}
 	limit := p.LimitOrDefault()
-	// 账户没有自增 ID，因此以 UserID 作为键集锚点。
-	keys := make([]distledger.UserKey, 0, minInt(limit*4, len(r.d.accounts)))
-	for k := range r.d.accounts {
-		if k.TenantID != tenantID || k.UserID <= p.AfterUserID {
-			continue
+	idx := r.d.accountIDs
+
+	// Accounts have no auto-increment id, so UserID is the keyset anchor.
+	start := sort.Search(len(idx), func(i int) bool {
+		if idx[i].TenantID != tenantID {
+			return idx[i].TenantID >= tenantID
 		}
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i].UserID < keys[j].UserID })
-	if len(keys) > limit {
-		keys = keys[:limit]
-	}
-	out := make([]distledger.Account, 0, len(keys))
-	for _, k := range keys {
-		out = append(out, r.d.accounts[k])
+		return idx[i].UserID > p.AfterUserID
+	})
+
+	out := make([]distledger.Account, 0, limit)
+	for i := start; i < len(idx) && len(out) < limit; i++ {
+		if idx[i].TenantID != tenantID {
+			break
+		}
+		if acct, ok := r.d.accounts[idx[i]]; ok {
+			out = append(out, acct)
+		}
 	}
 	return out, nil
 }
@@ -202,8 +230,9 @@ func (r *reader) CountCommissionsByState(ctx context.Context, tenantID int64) (m
 			continue
 		}
 		out[c.State]++
-		// 这是对账路径上的 O(全部佣金) 统计，不在请求链路上。
-		// 每 1024 条检查一次取消，避免长时间不可中断。
+		// This is an O(all commissions) statistic on the reconciliation path,
+		// not on a request path. Cancellation is checked periodically so the
+		// call stays interruptible on a large tenant.
 		n++
 		if n%1024 == 0 {
 			if err := ctx.Err(); err != nil {
@@ -214,7 +243,32 @@ func (r *reader) CountCommissionsByState(ctx context.Context, tenantID int64) (m
 	return out, nil
 }
 
-// collectLedger 按键集分页收集流水。
+func (r *reader) Tenants(ctx context.Context) ([]int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	seen := make(map[int64]struct{})
+	for k := range r.d.agents {
+		seen[k.TenantID] = struct{}{}
+	}
+	for k := range r.d.bindings {
+		seen[k.TenantID] = struct{}{}
+	}
+	for k := range r.d.accounts {
+		seen[k.TenantID] = struct{}{}
+	}
+	for k := range r.d.byOrder {
+		seen[k.TenantID] = struct{}{}
+	}
+	out := make([]int64, 0, len(seen))
+	for t := range seen {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+// collectLedger gathers ledger entries through a keyset-paginated id index.
 func collectLedger(d *data, ids []int64, q distledger.LedgerQuery) []distledger.LedgerEntry {
 	limit := q.Page.LimitOrDefault()
 	out := make([]distledger.LedgerEntry, 0, minInt(limit, len(ids)))
@@ -235,32 +289,6 @@ func collectLedger(d *data, ids []int64, q distledger.LedgerQuery) []distledger.
 		}
 	}
 	return out
-}
-
-func (r *reader) Tenants(ctx context.Context) ([]int64, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	seen := make(map[int64]struct{})
-	collect := func(t int64) { seen[t] = struct{}{} }
-	for k := range r.d.agents {
-		collect(k.TenantID)
-	}
-	for k := range r.d.bindings {
-		collect(k.TenantID)
-	}
-	for k := range r.d.accounts {
-		collect(k.TenantID)
-	}
-	for k := range r.d.byOrder {
-		collect(k.TenantID)
-	}
-	out := make([]int64, 0, len(seen))
-	for t := range seen {
-		out = append(out, t)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out, nil
 }
 
 func minInt(a, b int) int {

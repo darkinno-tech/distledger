@@ -7,20 +7,23 @@ import (
 	"time"
 )
 
-// 本文件是分佣引擎。它只做编排，不做判断：
-// 「算多少」交给 RateResolver，「够不够格」交给 EligibilityChecker，
-// 「钱能不能这么流」由状态机与这里的事务边界共同保证（见 ADR-002）。
+// This file is the commission engine. It only orchestrates; it does not
+// decide: "how much" goes to the RateResolver, "is this agent eligible" goes
+// to the EligibilityChecker, and "may the money move this way" is guaranteed
+// jointly by the state machine and the transaction boundaries drawn here (see
+// ADR-002).
 
-// accrualBase 是一次分佣的计算单位。
+// accrualBase is one unit of commission computation.
 //
-// 未提供 Items 时，整笔订单是一个计算单位（itemID 为空串）；
-// 提供了 Items 时，每个明细各自是一个计算单位，配额也各自独立。
+// When Items is not supplied, the whole order is a single unit (itemID is the
+// empty string); when Items is supplied, each line item is its own unit with
+// its own quota.
 type accrualBase struct {
 	itemID string
 	amount Money
 }
 
-// basesOf 把事件拆解为分佣计算单位。
+// basesOf breaks an event down into commission computation units.
 func basesOf(ev OrderPaidEvent) []accrualBase {
 	if len(ev.Items) == 0 {
 		return []accrualBase{{itemID: "", amount: ev.PaidAmount}}
@@ -32,29 +35,37 @@ func basesOf(ev OrderPaidEvent) []accrualBase {
 	return out
 }
 
-// OnOrderPaid 处理「订单已支付」，完成归因、分佣计算、入账与记账。
+// OnOrderPaid handles "the order has been paid": attribution, commission
+// computation, accrual and bookkeeping.
 //
-// # 幂等
+// # Idempotency
 //
-// 可以安全地重复投递。重复投递时返回 Replayed=true 且 Commissions 为空。
-// 幂等性由「订单已有佣金」的短路判断与每条佣金的唯一幂等键双重保证。
+// It is safe to deliver repeatedly. A repeat delivery returns Replayed=true
+// with an empty Commissions slice. Idempotency is guaranteed twice over: by
+// the short circuit on "the order already has commissions" and by the unique
+// idempotency key of every commission.
 //
-// # 归因规则
+// # Attribution rules
 //
-// 只有当绑定关系在**支付时刻**已经存在且有效时才会归因。这条规则防的是
-// 事后抢单：如果只看「当前绑定」，任何人只要在订单支付后把自己绑成买家
-// 的推广人就能追认这笔收益。
+// Attribution happens only when the binding already existed and was effective
+// at the **moment of payment**. This rule guards against after-the-fact
+// poaching: if only the "current binding" were consulted, anyone could bind
+// themselves as the buyer's referrer after the order was paid and have the
+// earnings confirmed retroactively.
 //
-// # 没有归因不是错误
+// # No attribution is not an error
 //
-// 买家没有推广归属时返回 Attributed=false 且 err 为 nil。订单系统不应该
-// 因为「这单没有推广人」而收到一个失败。
+// When the buyer has no referral attribution, it returns Attributed=false with
+// err nil. An order system should not receive a failure merely because "this
+// order has no referrer".
 //
-// # 已知边界
+// # Known boundary
 //
-// 幂等键是 (订单, 明细, 分销员, 层级) 的函数。因此如果在第一次投递之后
-// 修改了费率配置再重放同一事件，可能产生第一次没有的佣金。生产环境中
-// 请在订单产生前就固定费率；按订单冻结规则版本是后续版本的能力。
+// The idempotency key is a function of (order, line item, agent, level).
+// So if the rate configuration is changed after the first delivery and the
+// same event is replayed, commissions can appear that the first delivery did
+// not produce. In production, fix the rates before orders are created; freezing
+// the rule version per order is a capability of a later version.
 func (l *Ledger) OnOrderPaid(ctx context.Context, ev OrderPaidEvent) (AccrueResult, error) {
 	if err := ev.validate(); err != nil {
 		return AccrueResult{}, err
@@ -70,8 +81,9 @@ func (l *Ledger) OnOrderPaid(ctx context.Context, ev OrderPaidEvent) (AccrueResu
 
 	var result AccrueResult
 	err := l.store.Update(ctx, func(ctx context.Context, tx Tx) error {
-		// Store 的事务允许被重试，因此每次进入都必须从零重建结果，
-		// 否则重试会导致结果被累加两次。
+		// The Store may retry the transaction, so every entry must rebuild
+		// the result from scratch; otherwise a retry would accumulate the
+		// result twice.
 		result = AccrueResult{OrderKey: key}
 
 		existing, err := tx.CommissionsByOrder(ctx, key)
@@ -79,6 +91,15 @@ func (l *Ledger) OnOrderPaid(ctx context.Context, ev OrderPaidEvent) (AccrueResu
 			return err
 		}
 		if len(existing) > 0 {
+			// The order-level short circuit keys on OrderID alone, so a second
+			// event for the same order naming a DIFFERENT buyer is
+			// contradictory input rather than a replay. Swallowing it would
+			// hide a caller bug behind a success, so it is rejected.
+			if buyer := existing[0].BuyerUserID; buyer != ev.BuyerUserID {
+				return fieldErrf("buyer_user_id",
+					"order %s was already accrued for buyer %d but this event claims buyer %d",
+					ev.OrderID, buyer, ev.BuyerUserID)
+			}
 			result.Replayed = true
 			result.Attributed = true
 			result.AgentUserID = layerOneAgent(existing)
@@ -123,9 +144,10 @@ func (l *Ledger) OnOrderPaid(ctx context.Context, ev OrderPaidEvent) (AccrueResu
 			}
 			return err
 		}
-		// 第 1 级不合格意味着归因本身无效，整单不再分佣。
-		// 这与「中间层级不合格」的处理不同，见 accrueBase 的说明。
-		if ok, reason := l.elig.Eligible(ctx, first, key); !ok {
+		// Level 1 being ineligible means the attribution itself is invalid, so
+		// the whole order pays no commission. This differs from the handling
+		// of an ineligible middle level; see the note on accrueBase.
+		if ok, reason := l.elig.Eligible(ctx, EligibilityInput{Agent: first, Order: key, BuyerUserID: ev.BuyerUserID}); !ok {
 			result.Skipped = append(result.Skipped, SkipReason{
 				Layer: 1, AgentUserID: first.Key.UserID, Code: SkipIneligible, Detail: reason,
 			})
@@ -145,7 +167,8 @@ func (l *Ledger) OnOrderPaid(ctx context.Context, ev OrderPaidEvent) (AccrueResu
 	return result, nil
 }
 
-// layerOneAgent 从已有佣金中找出第 1 级的分销员，用于重放时回填结果。
+// layerOneAgent finds the level-1 agent among existing commissions, to
+// backfill the result on a replay.
 func layerOneAgent(list []Commission) int64 {
 	for _, c := range list {
 		if c.Layer == 1 {
@@ -155,20 +178,26 @@ func layerOneAgent(list []Commission) int64 {
 	return 0
 }
 
-// accrueBase 沿关系链向上为单个计算单位生成各级佣金。
+// accrueBase walks up the relation chain and generates the commission of every
+// level for one computation unit.
 //
-// # 中间层级不合格时的处理
+// # When a middle level is ineligible
 //
-// 某一级不合格只跳过该级，链条继续向上。理由是：关系链是客观存在的拓扑，
-// 而资格是个体的属性。如果让不合格节点截断链条，一个被临时禁用的人会
-// 无声地吞掉他所有上级的收益，这类问题在生产中极难排查和安抚。
+// An ineligible level is skipped and the chain continues upward. The reason is
+// that the relation chain is an objective topology, while eligibility is a
+// property of an individual. If an ineligible node truncated the chain, one
+// temporarily disabled person would silently swallow the earnings of every one
+// of their uplines, a problem that is extremely hard to diagnose and to smooth
+// over in production.
 //
-// 第 1 级是例外（见 OnOrderPaid）：它不合格意味着归因无效，整单不分佣。
+// Level 1 is the exception (see OnOrderPaid): it being ineligible means the
+// attribution is invalid and the whole order pays no commission.
 func (l *Ledger) accrueBase(ctx context.Context, tx Tx, ev OrderPaidEvent, base accrualBase, firstAgentID int64, result *AccrueResult) error {
 	order := ev.orderKey()
 
-	// 配额按「计算单位」独立计算，而不是按整单：否则一笔多明细订单会
-	// 让先处理的明细吃掉后处理明细的额度。
+	// The quota is computed per computation unit rather than per whole order;
+	// otherwise, in an order with several line items, the item handled first
+	// would eat into the allowance of the ones handled after it.
 	capAmount, err := base.amount.Apply(l.rules.MaxAllocatableBP, RoundDown)
 	if err != nil {
 		return err
@@ -198,7 +227,7 @@ func (l *Ledger) accrueBase(ctx context.Context, tx Tx, ev OrderPaidEvent, base 
 		}
 
 		if layer > 1 {
-			if ok, reason := l.elig.Eligible(ctx, agent, order); !ok {
+			if ok, reason := l.elig.Eligible(ctx, EligibilityInput{Agent: agent, Order: order, BuyerUserID: ev.BuyerUserID}); !ok {
 				result.Skipped = append(result.Skipped, SkipReason{
 					Layer: layer, AgentUserID: agentUserID, Code: SkipIneligible, Detail: reason,
 				})
@@ -219,8 +248,9 @@ func (l *Ledger) accrueBase(ctx context.Context, tx Tx, ev OrderPaidEvent, base 
 			return err
 		}
 
-		// 配额封顶：即使费率配置被改坏，分出去的总额也不会超过基数上限。
-		// 这是不变量 I2 的运行期保证。
+		// Quota cap: even if the rate configuration has been broken, the total
+		// paid out never exceeds the base ceiling. This is the runtime
+		// guarantee of invariant I2.
 		if remaining := capAmount - allocated; amount > remaining {
 			result.Skipped = append(result.Skipped, SkipReason{
 				Layer: layer, AgentUserID: agentUserID, Code: SkipCapExhausted,
@@ -257,8 +287,9 @@ func (l *Ledger) accrueBase(ctx context.Context, tx Tx, ev OrderPaidEvent, base 
 		})
 		if err != nil {
 			if errors.Is(err, ErrDuplicate) {
-				// 同一事务内不会重复，这里是防御性兜底：绝不因为一条重复
-				// 记录而中断整单分佣。
+				// Duplicates cannot happen inside one transaction; this is a
+				// defensive backstop so that a duplicate record never
+				// interrupts the accrual for the whole order.
 				agentUserID = agent.ParentID
 				continue
 			}
@@ -276,10 +307,12 @@ func (l *Ledger) accrueBase(ctx context.Context, tx Tx, ev OrderPaidEvent, base 
 	return nil
 }
 
-// creditAccrual 把佣金计入账户的「待结算」桶，并追加一条资金流水。
+// creditAccrual credits a commission into the account's "pending settlement"
+// bucket and appends one ledger entry.
 //
-// 记完账再写流水，是为了让流水里的 After* 反映变动后的真实余额——
-// 对账时只看单条流水就能判断那一时刻的余额状态。
+// The entry is written after the account is updated so that the After* values
+// in it reflect the true post-change balance: during reconciliation, a single
+// entry then suffices to tell what the balance was at that moment.
 func (l *Ledger) creditAccrual(ctx context.Context, tx Tx, c Commission, now time.Time) error {
 	key := UserKey{TenantID: c.Key.TenantID, UserID: c.AgentUserID}
 
@@ -287,7 +320,8 @@ func (l *Ledger) creditAccrual(ctx context.Context, tx Tx, c Commission, now tim
 	if err != nil {
 		return err
 	}
-	// 账户不存在时 Account 返回零值，其 Key 是空的，必须显式补上。
+	// When the account does not exist, Account returns a zero value whose Key
+	// is empty, so the Key must be filled in explicitly.
 	acct.Key = key
 
 	if acct.Frozen, err = acct.Frozen.Add(c.Amount); err != nil {

@@ -295,6 +295,8 @@ type OrderRefundedEvent struct {
 type OrderClosedEvent struct { TenantID int64; OrderID string; ClosedAt time.Time }
 ```
 
+退款事件的三种互斥表达（`IsFull` / `Items` / `Amount`）与**必填的** `IdemKey` 见 event.go。
+
 **幂等语义（对开发者最重要的承诺）**：上述每个事件都可以**安全地重复投递**。库内部从事件字段派生 `idem_key`，重复投递是 no-op。**开发者不需要自己设计去重。**
 
 ---
@@ -311,8 +313,17 @@ type OrderClosedEvent struct { TenantID int64; OrderID string; ClosedAt time.Tim
 func (l *Ledger) OnOrderPaid(ctx context.Context, ev OrderPaidEvent) (AccrueResult, error)
 func (l *Ledger) OnOrderReceived(ctx context.Context, ev OrderReceivedEvent) (ReceiveResult, error)
 
+// 退款冲正（幂等，需携带调用方的退款单号）
+func (l *Ledger) OnOrderRefunded(ctx context.Context, ev OrderRefundedEvent) (RefundResult, error)
+
+// 风控
+func (l *Ledger) FreezeCommission(ctx context.Context, tenantID, commissionID int64, reason string) (Commission, error)
+func (l *Ledger) UnfreezeCommission(ctx context.Context, tenantID, commissionID int64, reason string) (Commission, error)
+func (l *Ledger) VoidCommission(ctx context.Context, tenantID, commissionID int64, reason string) (Commission, error)
+
 // 心跳：推进所有时间驱动的状态（冻结到期 → 结算）
-func (l *Ledger) Maintain(ctx context.Context, now time.Time) (MaintainResult, error)
+// 处理时间一律来自注入的 Clock，不接受调用方传时间（见 ADR-023）
+func (l *Ledger) Maintain(ctx context.Context) (MaintainResult, error)
 
 // 关系链
 func (l *Ledger) BindAgent(ctx context.Context, req BindAgentRequest) (Agent, error)
@@ -508,7 +519,7 @@ bal, _ := led.Balance(ctx, 0, 1001) // 佣金已从「待结算」进入「可�
 | ⏳ `MinWithdraw` | `10000` | 起提门槛（100 元） | 避免小额打款成本倒挂 |
 | ⏳ `FeeRateBP` | `0` | 提现手续费 | 不额外收钱 |
 | ⏳ `SelfPurchase` | `false` | 自购是否分佣 | 自购返利是刷单温床，默认关 |
-| ⏳ `AllowNegative` | `false` | 冲正是否允许负余额 | 默认不允许，避免追债纠纷 |
+| ⏳ `AllowNegative` | — | 「已出账后追回」的欠款策略（v0.5 引入） | 目前冲正不会走到余额不足：钱必然还在桶里 |
 | ⏳ `AutoPayout` | `false` | 是否自动打款 | 默认人工审核闸门 |
 | ⏳ `BindType` | `首次点击` | 归因方式（v0.1 固定为首位优先，不可配） | 防抢客优先于灵活 |
 | ✅ `BindExpireDays` | `0`（永久） | 绑定有效期 | 显式配置才过期 |
@@ -523,7 +534,7 @@ bal, _ := led.Balance(ctx, 0, 1001) // 佣金已从「待结算」进入「可�
 |---|---|---|
 | **I1** | `SUM(dist_ledger.delta_*) == dist_account.*`（余额永远等于流水之和） | 账实不符 |
 | **I2** | 每个计算单位的佣金合计 ≤ 该单位基数 × `MaxAllocatableBP`，且每条佣金都能双向追溯到入账流水 | 平台每单亏损 / 记了佣金却没动钱 |
-| **I3** | 任意退款序列结束后：`SUM(净佣金) >= 0` 且 `净佣金 == 已结算 - 已冲正`（**随 v0.3 交付**） | 负数发钱 |
+| **I3** | 冲正累计额 == 冲正明细之和；`0 <= 累计额 <= 原始金额`；状态与累计额自洽；账户 `TotalEarned`/`TotalReversed` == 该分销员佣金汇总 | 负数发钱 / 少冲正 / 已冲正仍在结算 |
 
 ### 12.2 测试策略（**先写测试，再写实现**）
 
@@ -539,6 +550,7 @@ bal, _ := led.Balance(ctx, 0, 1001) // 佣金已从「待结算」进入「可�
 
 | 版本 | 范围 | 验收 |
 |---|---|---|
+| **v0.3** ✅ 已交付 | 退款冲正（整单/明细/部分、逐批累加）+ 风控冻结/解冻/没收 + 不变量 I3 + 对抗性审查修复 | 退款属性测试通过；三方对账恒成立 |
 | **v0.1** ✅ 已交付 | 内存 store + 关系链 + 归因 + 多级分佣 + 幂等键 + 冻结快照 + `Maintain` 结算 + I1/I2 自检 | `examples/01` 可跑；`-race` 全绿；覆盖率 88.7%/93.5%/92.9% |
 | **v0.2** | 规则层扩展（等级费率、SKU 级覆盖）+ `examples/02` | 规则可插拔验证 |
 | **v0.3** | 退款冲正（全退/部分退/已结算追回）+ I3 | `examples/03` 可跑 |
@@ -575,14 +587,16 @@ distledger/
 ├── ledger.go                 # 门面：New / BindAgent / BindBuyer / 查询
 ├── accrual.go                # 分佣引擎
 ├── settle.go                 # 冻结、收货、Maintain 结算
-├── selfcheck.go              # 不变量 I1 / I2 校验
+├── reversal.go               # 退款冲正（按累计目标值）
+├── risk.go                   # 风控：冻结 / 解冻 / 没收
+├── selfcheck.go              # 不变量 I1 / I2 / I3 校验
 │
 ├── internal/safemath/        # 128 位乘除与溢出检测原语
 ├── store/memory/             # 内存实现（事务回滚 / 键集分页 / 到期索引）
 ├── examples/01-quickstart/   # 零依赖可运行示例
 └── docs/
-    ├── design-decisions.md   # 22 条 ADR：每个"刻意为之"的取舍与代价
-    └── invariants.md         # ⏳ v0.3
+    ├── design-decisions.md   # 28 条 ADR：每个"刻意为之"的取舍与代价
+    └── invariants.md         # ⏳ 形式化描述（当前以 selfcheck.go 的测试为准）
 ```
 
 ### 工程规范

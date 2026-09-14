@@ -7,24 +7,27 @@ import (
 	"strconv"
 )
 
-// maxViolationsPerCheck 限制每个不变量记录的证据条数。
+// maxViolationsPerCheck caps how much evidence is recorded per invariant.
 //
-// 报告不是日志：它的用途是「一眼看出有没有问题、问题长什么样」。
-// 记录一千万条违规与记录二十条违规，对定位问题的价值是一样的，
-// 但前者会把内存和调用方的日志系统打挂。
+// A report is not a log: its purpose is to show at a glance whether anything
+// is wrong and what the problem looks like. Recording ten million violations
+// and recording twenty are worth the same when locating the problem, but the
+// former would take down both memory and the caller's logging system.
 const maxViolationsPerCheck = 20
 
-// InvariantResult 是一项不变量的检查结果。
+// InvariantResult is the check result of one invariant.
 type InvariantResult struct {
-	// Name 是不变量的稳定标识。
+	// Name is the stable identifier of the invariant.
 	Name string
-	// OK 报告是否全部通过。
+	// OK reports whether the check passed entirely.
 	OK bool
-	// Checked 是本次检查的对象数量，用于判断「通过」是不是因为「没查」。
+	// Checked is the number of objects examined by this check, which tells a
+	// real pass apart from a check that examined nothing.
 	Checked int
-	// Violations 是违规样本，最多 maxViolationsPerCheck 条。
+	// Violations are sample violations, at most maxViolationsPerCheck of them.
 	Violations []string
-	// TotalViolations 是违规总数，可能大于 len(Violations)。
+	// TotalViolations is the total number of violations, which may exceed
+	// len(Violations).
 	TotalViolations int
 }
 
@@ -36,27 +39,32 @@ func (r *InvariantResult) add(format string, args ...any) {
 	r.OK = false
 }
 
-// Report 是 SelfCheck 的结果。
+// Report is the result of SelfCheck.
 type Report struct {
 	TenantID int64
-	// OK 只有在全部不变量通过、且没有表结构问题时才为 true。
+	// OK is true only when every invariant passed and there are no schema
+	// issues.
 	OK bool
-	// StoreKind 是存储类型标识，例如 "memory"。
+	// StoreKind is the store type identifier, for example "memory".
 	StoreKind string
-	// SchemaIssues 是存储层报告的表结构问题（内存存储不会产生）。
+	// SchemaIssues are the schema issues reported by the store layer (the
+	// in-memory store produces none).
 	SchemaIssues []string
-	// Invariants 是各项不变量的检查结果。
+	// Invariants are the check results of the individual invariants.
 	Invariants []InvariantResult
-	// Counters 是各状态佣金笔数，用于发现「卡住不动」的数据。
+	// Counters are the commission counts per state, useful for spotting data
+	// that is stuck and no longer moving.
 	Counters map[string]int64
 }
 
-// SelfCheck 对某个租户执行账务自检。
+// SelfCheck runs a ledger self-check for one tenant.
 //
-// 这是接入排障的唯一入口：它一次性回答「账本是否守恒、有没有负余额、
-// 分佣是否超出配额、有没有指向不存在记录的流水、有没有卡住的数据」。
+// This is the single entry point for integration troubleshooting: it answers in
+// one shot whether the ledger is conserved, whether any balance is negative,
+// whether commissions exceeded their quota, whether any ledger entry points at
+// a record that does not exist, and whether any data is stuck.
 //
-// 它只读，不会修改任何数据。
+// It is read-only and modifies no data.
 func (l *Ledger) SelfCheck(ctx context.Context, tenantID int64) (Report, error) {
 	if tenantID < 0 {
 		return Report{}, fieldErrf("tenant_id", "must be >= 0, got %d", tenantID)
@@ -93,6 +101,12 @@ func (l *Ledger) SelfCheck(ctx context.Context, tenantID int64) (Report, error) 
 			return err
 		}
 		rep.Invariants = append(rep.Invariants, i2)
+
+		i3, err := l.checkReversalReconciliation(ctx, r, tenantID)
+		if err != nil {
+			return err
+		}
+		rep.Invariants = append(rep.Invariants, i3)
 		return nil
 	})
 	if err != nil {
@@ -108,16 +122,20 @@ func (l *Ledger) SelfCheck(ctx context.Context, tenantID int64) (Report, error) 
 	return rep, nil
 }
 
-// checkLedgerConservation 校验不变量 I1。
+// checkLedgerConservation verifies invariant I1.
 //
-// 三项检查合在一起才构成完整的 I1：
+// A complete I1 requires all three checks together:
 //
-//  1. 账户的每个资金桶等于该账户全部流水对应增量的和。
-//  2. 最后一条流水的 After* 等于账户当前值（防「改了账户却忘了记账」）。
-//  3. 不存在负的资金桶。
+//  1. Every money bucket of an account equals the sum of the corresponding
+//     deltas of all that account's ledger entries.
+//  2. The After* values of the last ledger entry equal the account's current
+//     values (this catches "the account was changed but the entry was
+//     forgotten").
+//  3. No money bucket is negative.
 //
-// 只做第 1 项是不够的：如果有人同时错误地修改了账户与流水，第 1 项
-// 仍然可能通过，而第 2 项会立刻暴露出来。
+// Check 1 alone is not enough: if someone mistakenly changed both the account
+// and the ledger entries, check 1 can still pass, while check 2 exposes it
+// immediately.
 func (l *Ledger) checkLedgerConservation(ctx context.Context, r Reader, tenantID int64) (InvariantResult, error) {
 	res := InvariantResult{Name: "I1: account balance equals sum of ledger deltas", OK: true}
 
@@ -180,7 +198,8 @@ func (l *Ledger) checkLedgerConservation(ctx context.Context, r Reader, tenantID
 			}
 
 			if entries == 0 {
-				// 没有流水的账户必须全零：账户只能由流水驱动产生。
+				// An account with no ledger entries must be all zeros:
+				// accounts can only come into being driven by ledger entries.
 				if acct.Frozen != 0 || acct.Available != 0 || acct.Withdrawing != 0 || acct.Withdrawn != 0 {
 					res.add("account %s has balances %s/%s/%s/%s but no ledger entries",
 						acct.Key, acct.Frozen, acct.Available, acct.Withdrawing, acct.Withdrawn)
@@ -210,7 +229,7 @@ func (l *Ledger) checkLedgerConservation(ctx context.Context, r Reader, tenantID
 	return res, nil
 }
 
-// allocKey 是配额校验的归组键。
+// allocKey is the grouping key of the allocation check.
 type allocKey struct {
 	orderKey    OrderKey
 	orderItemID string
@@ -221,21 +240,27 @@ type allocAgg struct {
 	amount Money
 }
 
-// checkAllocationCap 校验不变量 I2 与佣金-流水之间的引用完整性。
+// checkAllocationCap verifies invariant I2 and the referential integrity
+// between commissions and ledger entries.
 //
-// 它同时回答三个问题：
+// It answers three questions at once:
 //
-//  1. 每条佣金是否都有对应的入账流水（防「记了佣金却没动钱」）。
-//  2. 每条入账流水是否都指向存在的佣金（防悬空引用）。
-//  3. 每个「计算单位」分出的佣金总额是否在配额之内。
+//  1. Does every commission have a matching accrual ledger entry (this catches
+//     "the commission was recorded but no money moved")?
+//  2. Does every accrual ledger entry point at a commission that exists (this
+//     catches dangling references)?
+//  3. Is the total commission allocated to each computation unit within its
+//     quota?
 //
-// 第 1 项必须靠**直接枚举佣金**来完成。早期实现只顺着流水反查佣金，
-// 结果是「记了佣金但没动钱」这一最需要被发现的破坏形态恰好不可见。
+// Check 1 requires **enumerating commissions directly**. An earlier
+// implementation only looked commissions up backwards from ledger entries, so
+// the failure mode most in need of detection — "the commission was recorded
+// but no money moved" — was exactly the one that stayed invisible.
 func (l *Ledger) checkAllocationCap(ctx context.Context, r Reader, tenantID int64) (InvariantResult, error) {
 	res := InvariantResult{Name: "I2: commission ledger linkage and allocation cap", OK: true}
 	groups := make(map[allocKey]*allocAgg)
 
-	// 先扫一遍租户流水，收集全部入账引用。
+	// Scan the tenant's ledger first and collect every accrual reference.
 	ledgerRefs := make(map[int64]struct{})
 	var afterID int64
 	for {
@@ -248,7 +273,10 @@ func (l *Ledger) checkAllocationCap(ctx context.Context, r Reader, tenantID int6
 		}
 		for _, e := range page {
 			afterID = e.ID
-			if e.BizType != LedgerAccrue {
+			// Accruals, reversals and voids all carry a commission id in BizID.
+			// Collecting only accruals made every reversal record look like a
+			// commission with no ledger entry behind it.
+			if !e.BizType.referencesCommission() {
 				continue
 			}
 			id, err := strconv.ParseInt(e.BizID, 10, 64)
@@ -263,7 +291,8 @@ func (l *Ledger) checkAllocationCap(ctx context.Context, r Reader, tenantID int6
 		}
 	}
 
-	// 再直接枚举佣金：既校验反向引用，也做配额归组。
+	// Then enumerate the commissions directly: this both verifies the reverse
+	// references and groups them for the quota check.
 	known := make(map[int64]struct{})
 	var afterCommissionID int64
 	for {
@@ -280,8 +309,13 @@ func (l *Ledger) checkAllocationCap(ctx context.Context, r Reader, tenantID int6
 			known[c.ID] = struct{}{}
 
 			if _, linked := ledgerRefs[c.ID]; !linked {
-				res.add("commission %d (order %s layer %d, %s) has no accrual ledger entry",
+				res.add("commission %d (order %s layer %d, %s) has no ledger entry",
 					c.ID, c.Key.OrderID, c.Layer, c.Amount)
+			}
+			if c.Amount <= 0 {
+				// Reversal records are not accruals and take no part in the
+				// allocation cap; their own linkage was checked above.
+				continue
 			}
 			k := allocKey{orderKey: c.Key, orderItemID: c.OrderItemID}
 			g, ok := groups[k]
@@ -298,7 +332,8 @@ func (l *Ledger) checkAllocationCap(ctx context.Context, r Reader, tenantID int6
 		}
 	}
 
-	// 校验正向引用：流水指向的佣金必须存在。
+	// Verify the forward references: every commission a ledger entry points at
+	// must exist.
 	refs := make([]int64, 0, len(ledgerRefs))
 	for id := range ledgerRefs {
 		refs = append(refs, id)
@@ -310,12 +345,13 @@ func (l *Ledger) checkAllocationCap(ctx context.Context, r Reader, tenantID int6
 		}
 	}
 
-	// 最后校验配额。
+	// Finally, verify the quota.
 	keys := make([]allocKey, 0, len(groups))
 	for k := range groups {
 		keys = append(keys, k)
 	}
-	// 排序是为了让报告可复现：同样的数据永远得到同样的违规顺序。
+	// Sorting keeps the report reproducible: the same data always yields the
+	// same violation order.
 	sort.Slice(keys, func(i, j int) bool {
 		if keys[i].orderKey.TenantID != keys[j].orderKey.TenantID {
 			return keys[i].orderKey.TenantID < keys[j].orderKey.TenantID
@@ -339,6 +375,158 @@ func (l *Ledger) checkAllocationCap(ctx context.Context, r Reader, tenantID int6
 			}
 			res.add("order %s item %s allocated %s which exceeds cap %s (base %s)",
 				k.orderKey, item, g.amount, capAmount, g.base)
+		}
+	}
+	return res, nil
+}
+
+// checkReversalReconciliation verifies invariant I3.
+//
+// It answers three questions:
+//
+//  1. Does each commission's "reversed accumulator" equal the sum of the
+//     absolute values of all reversal records under its name? The two are the
+//     "balance" and the "journal" sides of one relationship and must always
+//     agree.
+//  2. Does the accumulator fall within [0, original amount], and is the state
+//     consistent with it (a commission reversed in full must be in a terminal
+//     state)?
+//  3. Do the gross and reversed totals on the account equal the roll-up of all
+//     that agent's commissions?
+//
+// Check 3 is deliberately independent of I1. I1 reconciles only the four money
+// buckets, and TotalEarned and TotalReversed are not among them. If those two
+// fields were left to "trust", a single mistaken write could make "total
+// earnings" diverge from the facts forever while the books themselves stayed
+// balanced everywhere.
+func (l *Ledger) checkReversalReconciliation(ctx context.Context, r Reader, tenantID int64) (InvariantResult, error) {
+	res := InvariantResult{Name: "I3: reversal accumulator, state and account totals reconcile", OK: true}
+
+	originalsWithReversal := make(map[int64]Money)
+	reversedByOriginal := make(map[int64]Money)
+	originalAmount := make(map[int64]Money)
+	accrued := make(map[int64]Money)
+	reversed := make(map[int64]Money)
+
+	var afterID int64
+	for {
+		page, err := r.CommissionsByTenant(ctx, tenantID, Page{AfterID: afterID, Limit: MaxPageLimit})
+		if err != nil {
+			return res, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, c := range page {
+			afterID = c.ID
+			agent := c.AgentUserID
+
+			if c.Amount > 0 {
+				if accrued[agent], err = accrued[agent].Add(c.Amount); err != nil {
+					return res, err
+				}
+				if c.ReversedAmount != 0 {
+					res.Checked++
+					originalsWithReversal[c.ID] = c.ReversedAmount
+					originalAmount[c.ID] = c.Amount
+					if c.ReversedAmount < 0 || c.ReversedAmount > c.Amount {
+						res.add("commission %d has reversed amount %s outside [0, %s]",
+							c.ID, c.ReversedAmount, c.Amount)
+					}
+					if c.FullyReversed() != (c.State == CommissionReversed || c.State == CommissionVoid) {
+						res.add("commission %d reversed %s of %s but state is %s",
+							c.ID, c.ReversedAmount, c.Amount, c.State)
+					}
+				}
+				continue
+			}
+
+			// A negative record is a reversal: it must point at a real accrual.
+			res.Checked++
+			if c.ReverseOf <= 0 {
+				res.add("commission %d has a negative amount %s but no reverse_of link", c.ID, c.Amount)
+				continue
+			}
+			original, err := r.Commission(ctx, c.ReverseOf)
+			if err != nil {
+				res.add("commission %d reverses missing commission %d", c.ID, c.ReverseOf)
+				continue
+			}
+			if original.Amount <= 0 {
+				res.add("commission %d reverses commission %d which is not an accrual", c.ID, c.ReverseOf)
+				continue
+			}
+			amount := -c.Amount
+			if reversedByOriginal[c.ReverseOf], err = reversedByOriginal[c.ReverseOf].Add(amount); err != nil {
+				return res, err
+			}
+			if reversed[agent], err = reversed[agent].Add(amount); err != nil {
+				return res, err
+			}
+			if _, seen := originalAmount[c.ReverseOf]; !seen {
+				originalAmount[c.ReverseOf] = original.Amount
+			}
+		}
+		if len(page) < MaxPageLimit {
+			break
+		}
+	}
+
+	// 1) and 2): the accumulator must equal the sum of its detail records.
+	ids := make([]int64, 0, len(originalsWithReversal)+len(reversedByOriginal))
+	seen := make(map[int64]struct{}, len(originalsWithReversal)+len(reversedByOriginal))
+	for id := range originalsWithReversal {
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	for id := range reversedByOriginal {
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	for _, id := range ids {
+		want := reversedByOriginal[id]
+		got := originalsWithReversal[id]
+		if got != want {
+			res.add("commission %d records %s reversed but its reversal records sum to %s",
+				id, got, want)
+		}
+		if amt, ok := originalAmount[id]; ok && want > amt {
+			res.add("commission %d was reversed %s which exceeds its amount %s", id, want, amt)
+		}
+	}
+
+	// 3): account totals must equal the per-agent roll-up.
+	var afterUserID int64
+	for {
+		accounts, err := r.AccountsByTenant(ctx, tenantID, AccountPage{
+			AfterUserID: afterUserID, Limit: MaxPageLimit,
+		})
+		if err != nil {
+			return res, err
+		}
+		if len(accounts) == 0 {
+			break
+		}
+		for _, acct := range accounts {
+			afterUserID = acct.Key.UserID
+			res.Checked++
+			if got, want := acct.TotalEarned, accrued[acct.Key.UserID]; got != want {
+				res.add("account %s total earned is %s but its accruals sum to %s",
+					acct.Key, got, want)
+			}
+			if got, want := acct.TotalReversed, reversed[acct.Key.UserID]; got != want {
+				res.add("account %s total reversed is %s but its reversals sum to %s",
+					acct.Key, got, want)
+			}
+		}
+		if len(accounts) < MaxPageLimit {
+			break
 		}
 	}
 	return res, nil
