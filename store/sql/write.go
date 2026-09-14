@@ -391,82 +391,121 @@ func (t *tx) IncrementAccount(ctx context.Context, delta distledger.AccountDelta
 		return acct, err
 	}
 
-	// The update is attempted first, because a missing account is the rarer case
-	// and a mismatch tells us which case we are in.
-	b := t.b()
-	update := "UPDATE " + t.table("dist_account") + " SET " +
-		t.cols("frozen") + " = " + t.cols("frozen") + " + " + b.add(delta.Frozen) + ", " +
-		t.cols("available") + " = " + t.cols("available") + " + " + b.add(delta.Available) + ", " +
-		t.cols("withdrawing") + " = " + t.cols("withdrawing") + " + " + b.add(delta.Withdrawing) + ", " +
-		t.cols("withdrawn") + " = " + t.cols("withdrawn") + " + " + b.add(delta.Withdrawn) + ", " +
-		t.cols("total_earned") + " = " + t.cols("total_earned") + " + " + b.add(delta.TotalEarned) + ", " +
-		t.cols("total_reversed") + " = " + t.cols("total_reversed") + " + " + b.add(delta.TotalReversed) + ", " +
-		t.cols("version") + " = " + t.cols("version") + " + 1" +
-		" WHERE " + t.cols("tenant_id") + " = " + b.add(delta.Key.TenantID) +
-		" AND " + t.cols("user_id") + " = " + b.add(delta.Key.UserID)
-	if delta.RequireNonNegative {
-		// Each bucket's post-state must be non-negative. Writing it as a
-		// predicate is what makes the guard part of the same atomic statement.
-		update += " AND " + t.cols("frozen") + " + " + b.add(delta.Frozen) + " >= 0" +
-			" AND " + t.cols("available") + " + " + b.add(delta.Available) + " >= 0" +
-			" AND " + t.cols("withdrawing") + " + " + b.add(delta.Withdrawing) + " >= 0" +
-			" AND " + t.cols("withdrawn") + " + " + b.add(delta.Withdrawn) + " >= 0"
-	}
-
-	res, err := t.updateVersioned(ctx, update, b.vals)
-	if err != nil {
-		return distledger.Account{}, err
-	}
-	if res.affected == 1 {
-		acct, _, err := t.lookupAccount(ctx, delta.Key)
-		return acct, err
-	}
-
-	_, found, err := t.lookupAccount(ctx, delta.Key)
-	if err != nil {
-		return distledger.Account{}, err
-	}
-	if found {
-		// The row exists, so the guard is what rejected the update.
-		return distledger.Account{}, fmt.Errorf(
-			"%w: applying %s would leave a bucket of account %s negative",
-			distledger.ErrInsufficientBalance, delta.Key, delta.Key)
-	}
-
-	// No account yet: create it from the delta itself.
-	seed, err := delta.Apply(distledger.Account{Key: delta.Key})
-	if err != nil {
-		return distledger.Account{}, err
-	}
-	if delta.RequireNonNegative {
-		if bad := seed.NegativeBuckets(); len(bad) > 0 {
-			return distledger.Account{}, fmt.Errorf(
-				"%w: applying %s would leave the %s bucket negative",
-				distledger.ErrInsufficientBalance, delta.Key, bad[0])
+	// Two passes at most. The first applies the delta to an existing account or
+	// creates the row; losing the create race sends us round again, because by
+	// then the winner's row exists and the same UPDATE applies. Increments are
+	// commutative, so re-applying the delta is not the same as applying it
+	// twice.
+	//
+	// Without the second pass a burst of first-ever accruals for one agent —
+	// the very first order an agent ever earns on, fanned out over concurrent
+	// callers — would have every caller but one fail with a conflict, even
+	// though nothing about the request was wrong.
+	for attempt := 0; ; attempt++ {
+		// The update is attempted first, because a missing account is the rarer
+		// case and a mismatch tells us which case we are in.
+		b := t.b()
+		update := "UPDATE " + t.table("dist_account") + " SET " +
+			t.cols("frozen") + " = " + t.cols("frozen") + " + " + b.add(delta.Frozen) + ", " +
+			t.cols("available") + " = " + t.cols("available") + " + " + b.add(delta.Available) + ", " +
+			t.cols("withdrawing") + " = " + t.cols("withdrawing") + " + " + b.add(delta.Withdrawing) + ", " +
+			t.cols("withdrawn") + " = " + t.cols("withdrawn") + " + " + b.add(delta.Withdrawn) + ", " +
+			t.cols("total_earned") + " = " + t.cols("total_earned") + " + " + b.add(delta.TotalEarned) + ", " +
+			t.cols("total_reversed") + " = " + t.cols("total_reversed") + " + " + b.add(delta.TotalReversed) + ", " +
+			t.cols("version") + " = " + t.cols("version") + " + 1" +
+			" WHERE " + t.cols("tenant_id") + " = " + b.add(delta.Key.TenantID) +
+			" AND " + t.cols("user_id") + " = " + b.add(delta.Key.UserID)
+		if delta.RequireNonNegative {
+			// Each bucket's post-state must be non-negative. Writing it as a
+			// predicate is what makes the guard part of the same atomic
+			// statement.
+			update += " AND " + t.cols("frozen") + " + " + b.add(delta.Frozen) + " >= 0" +
+				" AND " + t.cols("available") + " + " + b.add(delta.Available) + " >= 0" +
+				" AND " + t.cols("withdrawing") + " + " + b.add(delta.Withdrawing) + " >= 0" +
+				" AND " + t.cols("withdrawn") + " + " + b.add(delta.Withdrawn) + " >= 0"
 		}
-	}
 
-	ins := t.b()
-	insert := "INSERT INTO " + t.table("dist_account") + " (" + t.accountCols() + ") VALUES (" +
-		ins.add(seed.Key.TenantID) + ", " + ins.add(seed.Key.UserID) + ", " +
-		ins.add(seed.Frozen) + ", " + ins.add(seed.Available) + ", " +
-		ins.add(seed.Withdrawing) + ", " + ins.add(seed.Withdrawn) + ", " +
-		ins.add(seed.TotalEarned) + ", " + ins.add(seed.TotalReversed) + ", " +
-		ins.add(int64(1)) + ", " + ins.add(instantOrNull(time.Now().UTC())) + ")"
-	inserted, err := t.execInsert(ctx, insert, ins.vals)
-	if err != nil {
-		return distledger.Account{}, fmt.Errorf("sqlstore: insert account: %w", err)
-	}
-	if !inserted {
-		// Another transaction created it between the UPDATE and the INSERT, so
-		// this delta has not been applied yet. Reporting a conflict lets the
-		// caller retry, which the port's retry contract permits.
+		res, err := t.updateVersioned(ctx, update, b.vals)
+		if err != nil {
+			return distledger.Account{}, err
+		}
+		if res.affected == 1 {
+			acct, _, err := t.lookupAccount(ctx, delta.Key)
+			return acct, err
+		}
+
+		acct, found, err := t.lookupAccount(ctx, delta.Key)
+		if err != nil {
+			return distledger.Account{}, err
+		}
+		if found {
+			// Zero affected rows with the row present has two causes, and they
+			// need opposite responses.
+			//
+			// Either the guard refused the change — a real refusal, the answer
+			// the caller asked for — or the row was created after this UPDATE
+			// ran, in which case the UPDATE simply missed it and the delta has
+			// not been applied at all. Telling them apart by looking at the row
+			// is what makes the difference: a refused change leaves the delta
+			// driving a bucket negative, a missed row does not.
+			after, err := delta.Apply(acct)
+			if err != nil {
+				return distledger.Account{}, err
+			}
+			if bad := after.NegativeBuckets(); delta.RequireNonNegative && len(bad) > 0 {
+				return distledger.Account{}, fmt.Errorf(
+					"%w: applying %+v to account %s would leave the %v bucket negative",
+					distledger.ErrInsufficientBalance, delta, delta.Key, bad[0])
+			}
+			if attempt == 0 {
+				continue
+			}
+			return distledger.Account{}, &distledger.ConflictError{
+				Kind: "account", ID: delta.Key.String(), Expected: acct.Version, Actual: acct.Version,
+			}
+		}
+
+		// No account yet: create it from the delta itself.
+		seed, err := delta.Apply(distledger.Account{Key: delta.Key})
+		if err != nil {
+			return distledger.Account{}, err
+		}
+		if delta.RequireNonNegative {
+			if bad := seed.NegativeBuckets(); len(bad) > 0 {
+				return distledger.Account{}, fmt.Errorf(
+					"%w: applying %s would leave the %s bucket negative",
+					distledger.ErrInsufficientBalance, delta.Key, bad[0])
+			}
+		}
+
+		ins := t.b()
+		insert := "INSERT INTO " + t.table("dist_account") + " (" + t.accountCols() + ") VALUES (" +
+			ins.add(seed.Key.TenantID) + ", " + ins.add(seed.Key.UserID) + ", " +
+			ins.add(seed.Frozen) + ", " + ins.add(seed.Available) + ", " +
+			ins.add(seed.Withdrawing) + ", " + ins.add(seed.Withdrawn) + ", " +
+			ins.add(seed.TotalEarned) + ", " + ins.add(seed.TotalReversed) + ", " +
+			ins.add(int64(1)) + ", " + ins.add(instantOrNull(time.Now().UTC())) + ")"
+		inserted, err := t.execInsert(ctx, insert, ins.vals)
+		if err != nil {
+			return distledger.Account{}, fmt.Errorf("sqlstore: insert account: %w", err)
+		}
+		if inserted {
+			seed.Version = 1
+			return seed, nil
+		}
+
+		if attempt == 0 {
+			// Another transaction created the row between the UPDATE and the
+			// INSERT. Go round again to apply the delta to it.
+			continue
+		}
+		// Two consecutive failures to apply an increment means the account is
+		// being created and deleted underneath us, which is not something a
+		// third attempt would fix.
 		return distledger.Account{}, &distledger.ConflictError{
 			Kind: "account", ID: delta.Key.String(), Expected: 0, Actual: 0,
 		}
 	}
-	seed.Version = 1
-	return seed, nil
 }
 
 // ── Commission ──────────────────────────────────────────────────────────

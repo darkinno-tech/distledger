@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -525,6 +526,10 @@ func TestEngineConcurrentOrdersToOneAgent(t *testing.T) {
 				accrued int64
 				failed  int64
 			)
+			var (
+				mu       sync.Mutex
+				firstErr error
+			)
 			done := make(chan struct{}, orders)
 			for i := 0; i < orders; i++ {
 				go func(n int) {
@@ -538,6 +543,11 @@ func TestEngineConcurrentOrdersToOneAgent(t *testing.T) {
 					})
 					if err != nil {
 						atomic.AddInt64(&failed, 1)
+						mu.Lock()
+						if firstErr == nil {
+							firstErr = err
+						}
+						mu.Unlock()
 						return
 					}
 					atomic.AddInt64(&accrued, int64(len(res.Commissions)))
@@ -548,7 +558,11 @@ func TestEngineConcurrentOrdersToOneAgent(t *testing.T) {
 			}
 
 			if failed != 0 {
-				t.Fatalf("%d of %d orders failed; concurrent writers must not conflict", failed, orders)
+				mu.Lock()
+				reason := firstErr
+				mu.Unlock()
+				t.Fatalf("%d of %d orders failed; concurrent writers must not conflict; first error: %v",
+					failed, orders, reason)
 			}
 			if accrued != orders {
 				t.Fatalf("%d commissions accrued, want %d", accrued, orders)
