@@ -8,7 +8,7 @@
 | **日期** | 2026-09-14 |
 | **许可** | MIT |
 | **定位** | 开源、非商业、零强依赖的 Go 分销**资金账务**内核 |
-| **模块路径** | `github.com/im10furry/distledger`（可按实际组织调整） |
+| **模块路径** | `github.com/darkinno-tech/distledger`（可按实际组织调整） |
 
 ---
 
@@ -494,7 +494,7 @@ bal, _ := led.Balance(ctx, 0, 1001) // 佣金已从「待结算」进入「可�
 ### 10.6 接入完成度自检清单（写进 README）
 
 ```
-□ go get github.com/im10furry/distledger
+□ go get github.com/darkinno-tech/distledger
 □ go run ./examples/01-quickstart          → 看到佣金数字（30 秒）
 □ Store 换成 mysqlstore + 调 Migrate()      → 表已建好
 □ 订单支付成功后调 OnOrderPaid()            → 佣金出现在 dist_commission

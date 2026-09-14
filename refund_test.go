@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
 )
 
 // refundSeq hands out distinct refund identifiers, standing in for the refund

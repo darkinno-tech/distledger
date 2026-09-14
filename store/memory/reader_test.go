@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
 )
 
 // This file covers the validation branches of the read and write paths. They

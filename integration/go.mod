@@ -6,15 +6,15 @@
 //
 //	go test ./...                 # at the repository root: no database needed
 //	cd integration && go test ./...   # requires the containers below
-module github.com/im10furry/distledger/integration
+module github.com/darkinno-tech/distledger/integration
 
 go 1.25.0
 
-replace github.com/im10furry/distledger => ../
+replace github.com/darkinno-tech/distledger => ../
 
 require (
 	github.com/go-sql-driver/mysql v1.10.1
-	github.com/im10furry/distledger v0.0.0-00010101000000-000000000000
+	github.com/darkinno-tech/distledger v0.0.0-00010101000000-000000000000
 	github.com/jackc/pgx/v5 v5.11.0
 	modernc.org/sqlite v1.58.0
 )

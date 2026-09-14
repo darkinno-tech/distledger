@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
 )
 
 // This file covers defensive branches on the refund and risk-control paths that

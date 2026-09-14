@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/im10furry/distledger"
-	"github.com/im10furry/distledger/store/memory"
+	"github.com/darkinno-tech/distledger"
+	"github.com/darkinno-tech/distledger/store/memory"
 )
 
 // This file pins the COST of the heartbeat, not just its result.

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/im10furry/distledger"
-	"github.com/im10furry/distledger/store/memory"
+	"github.com/darkinno-tech/distledger"
+	"github.com/darkinno-tech/distledger/store/memory"
 )
 
 // This file holds regression tests for defects found during an adversarial

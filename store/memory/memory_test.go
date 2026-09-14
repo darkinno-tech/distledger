@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
 )
 
 // This file holds **internal** tests for the in-memory Store: it inspects

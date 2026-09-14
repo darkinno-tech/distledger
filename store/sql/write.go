@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
 )
 
 // This file holds the write half of the port.

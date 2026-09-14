@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/go-1.22%2B-blue.svg)](https://go.dev/)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#设计铁律)
+[![Go Reference](https://pkg.go.dev/badge/github.com/darkinno-tech/distledger.svg)](https://pkg.go.dev/github.com/darkinno-tech/distledger)
 
 `distledger` 只解决三件事：**关系链**、**佣金账**、**资金流水**。
 规则（几级、多少比例、要不要门槛）全部外置为可插拔策略。
@@ -12,6 +13,7 @@
 **它不是一个分销系统**，而是你自建分销系统时那块最容易写错、又最不该重写的底座。
 
 > 📄 完整需求与设计见 **[PRD.md](PRD.md)** ｜ 关键决策与取舍见 **[docs/design-decisions.md](docs/design-decisions.md)**
+> 每条不变量保证什么、**不覆盖什么**见 **[docs/invariants.md](docs/invariants.md)** ｜ 出过的问题与根因见 **[docs/fault-reviews/](docs/fault-reviews/)**
 
 ---
 
@@ -19,20 +21,24 @@
 
 | 能力 | 状态 |
 |---|---|
-| 金额/费率安全运算（整数、防溢出、显式舍入、配额封顶） | ✅ v0.1 |
-| 关系链（父子、深度上限、环检测、上级不可悄悄变更） | ✅ v0.1 |
-| 归因绑定（首次优先、有效期、防抢客、防事后追认） | ✅ v0.1 |
-| 多级分佣（含按 SKU 分佣、幂等键、可解释的跳过原因） | ✅ v0.1 |
-| 冻结期快照 + `Maintain` 结算（状态机 + 乐观锁） | ✅ v0.1 |
-| `SelfCheck` 不变量自检（I1 余额守恒 / I2 配额与引用完整性） | ✅ v0.1 |
-| 内存 Store（事务回滚、键集分页、到期索引） | ✅ v0.1 |
-| 退款冲正（整单全额 / 按明细 / 整单部分，逐批累加） | ✅ v0.3 |
-| 风控冻结 / 解冻 / 没收（`Freeze` / `Unfreeze` / `Void`） | ✅ v0.3 |
-| `SelfCheck` 不变量 I3（冲正累计额 ↔ 明细 ↔ 账户三方对账） | ✅ v0.3 |
-| MySQL Store | ⏳ v0.4 |
-| 提现链路与打款通道（含「已出账后追回」的欠款策略） | ⏳ v0.5 |
+| 金额/费率安全运算（整数、防溢出、显式舍入、配额封顶） | ✅ |
+| 关系链（父子、深度上限、环检测、上级不可悄悄变更） | ✅ |
+| 归因绑定（首次优先、有效期、防抢客、防事后追认） | ✅ |
+| 多级分佣（含按 SKU 分佣、幂等键、可解释的跳过原因） | ✅ |
+| 冻结期快照 + `Maintain` 结算（状态机 + 乐观锁） | ✅ |
+| `SelfCheck` 不变量 I1 / I2 / I3 | ✅ |
+| 内存 Store（事务回滚、键集分页、到期索引） | ✅ |
+| 退款冲正（整单全额 / 按明细 / 整单部分，逐批累加） | ✅ |
+| 风控冻结 / 解冻 / 没收（`Freeze` / `Unfreeze` / `Void`） | ✅ |
+| **可插拔 SQL Store：一套内核，MySQL / PostgreSQL / SQLite 方言** | ✅ |
+| **集合式对账：`SelfCheck` 不必再逐行读完整本流水** | ✅ |
+| 提现链路与打款通道（含「已出账后追回」的欠款策略） | ⏳ |
 
-**v0.1 已可直接用于单进程部署与测试环境**；生产多实例部署请等 v0.4 的 MySQL Store。
+**除提现外均已可用**，包括 MySQL / PostgreSQL / SQLite 上的生产多实例部署。
+`v0.1.0` 是首个打 tag 的版本。
+
+**尚未实现**：提现与打款通道。在此落地之前，`Maintain` 结算后的钱停留在 `available` 桶里——
+库不会声称它已出账，因为它无从得知。
 
 ---
 
@@ -67,7 +73,7 @@
 ## 快速开始（30 秒，不需要 MySQL）
 
 ```bash
-git clone https://github.com/im10furry/distledger.git
+git clone https://github.com/darkinno-tech/distledger.git
 cd distledger/examples/01-quickstart
 go run .
 ```
@@ -96,8 +102,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/im10furry/distledger"
-	"github.com/im10furry/distledger/store/memory"
+	"github.com/darkinno-tech/distledger"
+	"github.com/darkinno-tech/distledger/store/memory"
 )
 
 func main() {
@@ -166,7 +172,7 @@ func main() {
 ## 接入清单
 
 ```
-□ go get github.com/im10furry/distledger
+□ go get github.com/darkinno-tech/distledger
 □ go run ./examples/01-quickstart          → 30 秒看到佣金数字
 □ Rules 里显式配置 RateBP                  → 默认费率是 0（刻意，见 ADR-010）
 □ 订单支付成功后调 OnOrderPaid()            → 佣金出现在「待结算」
@@ -195,7 +201,7 @@ func main() {
 
 ## 数据模型
 
-v0.1 落地 6 张逻辑表（内存 Store 实现）：
+七张逻辑表。内存 Store 用 map 与索引实现，SQL Store 用可移植的 `CREATE TABLE`（方言只改类型名与索引 DDL）：
 
 | 表 | 作用 |
 |---|---|
@@ -205,7 +211,7 @@ v0.1 落地 6 张逻辑表（内存 Store 实现）：
 | `dist_account` | 账户（待结算 / 可提现 / 提现中 / 已提现 / 累计） |
 | `dist_ledger` | 资金流水，**复式只追加** |
 | `dist_refund` | 退款凭证：每批次 × 每明细一行，含该明细的**累计退款额** |
-| `dist_withdraw` | ⏳ v0.5 |
+| `dist_withdraw` | ⏳ 尚未实现（提现） |
 
 详见 [PRD.md §6](PRD.md#6-领域模型)。
 

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/im10furry/distledger"
-	"github.com/im10furry/distledger/store/memory"
+	"github.com/darkinno-tech/distledger"
+	"github.com/darkinno-tech/distledger/store/memory"
 )
 
 // This file uses an **external test package** (package distledger_test).

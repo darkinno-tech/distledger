@@ -7,7 +7,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
 )
 
 // tx is the read-write handle used inside a transaction.

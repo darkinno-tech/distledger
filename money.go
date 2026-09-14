@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/im10furry/distledger/internal/safemath"
+	"github.com/darkinno-tech/distledger/internal/safemath"
 )
 
 // RateScale is the fixed denominator for rates. A rate is stored in basis

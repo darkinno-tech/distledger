@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/im10furry/distledger/store/mysql"
-	"github.com/im10furry/distledger/store/postgres"
-	sqlstore "github.com/im10furry/distledger/store/sql"
+	"github.com/darkinno-tech/distledger/store/mysql"
+	"github.com/darkinno-tech/distledger/store/postgres"
+	sqlstore "github.com/darkinno-tech/distledger/store/sql"
 )
 
 // Query-plan probes for the heartbeat.

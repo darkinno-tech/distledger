@@ -6,7 +6,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
 )
 
 // reader is the read-only handle. The caller must already hold either the read

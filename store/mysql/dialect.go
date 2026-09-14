@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"strings"
 
-	sqlstore "github.com/im10furry/distledger/store/sql"
+	sqlstore "github.com/darkinno-tech/distledger/store/sql"
 )
 
 // Dialect implements sqlstore.Dialect for MySQL 5.7 and later, including MariaDB.

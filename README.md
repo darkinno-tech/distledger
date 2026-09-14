@@ -11,8 +11,17 @@ Every rule — how many levels, what rates, whether there is an entry bar — is
 
 **It is not a distribution system.** It is the part of one that is easiest to get wrong and should never be rewritten.
 
-> 📄 Full requirements and design: **[PRD.md](PRD.md)** ｜ Decisions and their costs: **[docs/design-decisions.md](docs/design-decisions.md)** ｜
-> Behavior at billion-row scale: **[docs/scale.md](docs/scale.md)** (all three are Chinese; they record design intent for the maintainer)
+[![Go Reference](https://pkg.go.dev/badge/github.com/darkinno-tech/distledger.svg)](https://pkg.go.dev/github.com/darkinno-tech/distledger)
+[![Go Report Card](https://goreportcard.com/badge/github.com/darkinno-tech/distledger)](https://goreportcard.com/report/github.com/darkinno-tech/distledger)
+
+**Docs:** [What each invariant guarantees — and what it does not](docs/invariants.md) ｜
+[Decisions and their costs](docs/design-decisions.md) ｜
+[Fault reviews](docs/fault-reviews/) ｜ [Behavior at billion-row scale](docs/scale.md) ｜
+[Requirements and design](PRD.md)
+
+All of them are in Chinese: they record design intent for the maintainer, and the trade-offs read
+better in the language they were argued in. The code, its comments and the commit history are English.
+
 > 中文说明见 **[README.zh-CN.md](README.zh-CN.md)**。
 
 ---
@@ -21,21 +30,25 @@ Every rule — how many levels, what rates, whether there is an entry bar — is
 
 | Capability | Status |
 |---|---|
-| Money and rate arithmetic (integer, overflow-checked, explicit rounding, allocation cap) | ✅ v0.1 |
-| Relation chain (parent links, depth ceiling, cycle detection, parent cannot change quietly) | ✅ v0.1 |
-| Attribution binding (first-wins, expiry, poaching protection, no retroactive capture) | ✅ v0.1 |
-| Multi-level accrual (per SKU, idempotency keys, typed reasons for skipped levels) | ✅ v0.1 |
-| Freeze snapshot + `Maintain` settlement (state machine + optimistic locking) | ✅ v0.1 |
-| `SelfCheck` invariants I1 / I2 | ✅ v0.1 |
-| In-memory store (transactional rollback, keyset pagination, due index) | ✅ v0.1 |
-| Refund reversal (full order / per item / partial, accumulated in instalments) | ✅ v0.3 |
-| Risk control: freeze, unfreeze, void | ✅ v0.3 |
-| `SelfCheck` invariant I3 (reversal accumulator ↔ detail ↔ account reconciliation) | ✅ v0.3 |
-| **Pluggable SQL store: one core, MySQL / PostgreSQL / SQLite dialects** | ✅ v0.4 |
-| Withdrawals and payout channels (including the debt policy for clawing back money already paid out) | ⏳ v0.5 |
+| Money and rate arithmetic (integer, overflow-checked, explicit rounding, allocation cap) | ✅ |
+| Relation chain (parent links, depth ceiling, cycle detection, parent cannot change quietly) | ✅ |
+| Attribution binding (first-wins, expiry, poaching protection, no retroactive capture) | ✅ |
+| Multi-level accrual (per SKU, idempotency keys, typed reasons for skipped levels) | ✅ |
+| Freeze snapshot + `Maintain` settlement (state machine + optimistic locking) | ✅ |
+| `SelfCheck` invariants I1 / I2 / I3 | ✅ |
+| In-memory store (transactional rollback, keyset pagination, due index) | ✅ |
+| Refund reversal (full order / per item / partial, accumulated in instalments) | ✅ |
+| Risk control: freeze, unfreeze, void | ✅ |
+| **Pluggable SQL store: one core, MySQL / PostgreSQL / SQLite dialects** | ✅ |
+| **Set-based reconciliation, so `SelfCheck` does not need to read every ledger row** | ✅ |
+| Withdrawals and payout channels (including the debt policy for clawing back money already paid out) | ⏳ |
 
-**v0.1–v0.3 are usable today** for single-process deployments and test environments.
-For a multi-instance production deployment, wait for the SQL store in v0.4.
+**Everything above except withdrawals is usable today**, including multi-instance production
+deployments on MySQL, PostgreSQL or SQLite. `v0.1.0` is the first tagged release.
+
+**Not yet built:** withdrawals and payout channels. Until they exist, money that
+`Maintain` has settled stays in the `available` bucket — the library will not tell you it
+has been paid out, because it cannot know.
 
 ---
 
@@ -61,8 +74,8 @@ Pick a backend by importing one package:
 
 ```go
 import (
-	"github.com/im10furry/distledger"
-	memstore "github.com/im10furry/distledger/store/memory"
+	"github.com/darkinno-tech/distledger"
+	memstore "github.com/darkinno-tech/distledger/store/memory"
 )
 
 led, _ := distledger.New(distledger.Config{Store: memstore.New(), Rules: rules})
@@ -85,8 +98,8 @@ import (
 	"database/sql"
 
 	_ "github.com/go-sql-driver/mysql" // your import, not ours
-	sqlstore "github.com/im10furry/distledger/store/sql"
-	"github.com/im10furry/distledger/store/mysql"
+	sqlstore "github.com/darkinno-tech/distledger/store/sql"
+	"github.com/darkinno-tech/distledger/store/mysql"
 )
 
 db, _ := sql.Open("mysql", dsn)
@@ -120,7 +133,13 @@ The driver import stays in your module. This is why the library's `go.mod` has a
 ## Getting started (30 seconds, no database required)
 
 ```bash
-git clone https://github.com/im10furry/distledger.git
+go get github.com/darkinno-tech/distledger
+```
+
+Or run the example straight from the repository — no database, no configuration:
+
+```bash
+git clone https://github.com/darkinno-tech/distledger.git
 cd distledger/examples/01-quickstart
 go run .
 ```
@@ -150,8 +169,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/im10furry/distledger"
-	"github.com/im10furry/distledger/store/memory"
+	"github.com/darkinno-tech/distledger"
+	"github.com/darkinno-tech/distledger/store/memory"
 )
 
 func main() {
@@ -222,7 +241,7 @@ Risk control adds `FreezeCommission` / `UnfreezeCommission` / `VoidCommission`, 
 ## Integration checklist
 
 ```
-□ go get github.com/im10furry/distledger
+□ go get github.com/darkinno-tech/distledger
 □ go run ./examples/01-quickstart          → see commission numbers in 30 seconds
 □ set RateBP explicitly in Rules           → the default rate is zero, deliberately (ADR-010)
 □ call OnOrderPaid() after a successful payment   → commission appears as "frozen"
@@ -262,7 +281,7 @@ Seven logical tables (the in-memory store implements them as maps and indexes):
 | `dist_account` | Balances: frozen / available / withdrawing / withdrawn, plus gross and reversed totals |
 | `dist_ledger` | Double-entry money trail. **Append-only.** |
 | `dist_refund` | Refund vouchers: one row per instalment per item, carrying the **cumulative refunded amount** |
-| `dist_withdraw` | ⏳ v0.5 |
+| `dist_withdraw` | ⏳ not yet built (withdrawals) |
 
 See [PRD.md §6](PRD.md) for the field-level design.
 
@@ -282,10 +301,18 @@ These are the entire reason the library exists, and the things `SelfCheck` shoul
 > A reflection test forces every new `Money` field on `Account` to be classified as either a bucket or an explicitly exempt total with a named covering invariant,
 > so an invariant cannot quietly stop applying to a new field (ADR-029).
 
-**Cost is tested, not just correctness.** The heartbeat's operation count is asserted directly, because a
-per-tenant loop and a per-work loop settle exactly the same commissions — the difference only appears at scale,
-which is the worst place to discover it. With 500 idle tenants and nothing due, `Maintain` must perform
-exactly one read and zero transactions. See [docs/scale.md](docs/scale.md).
+**Cost is tested, not just correctness.** Two things a results-only test cannot see are pinned directly:
+
+- The heartbeat's operation count. A per-tenant loop and a per-work loop settle exactly the same
+  commissions, so the difference only appears at scale. With 500 idle tenants and nothing due, `Maintain`
+  must perform exactly one read and zero transactions.
+- The reconciliation's shape. On a store that can aggregate in place, I1 is checked by the database and
+  only disagreeing accounts cross the wire; on one that cannot, it is checked row by row. Both paths call
+  the *same* judgement function, and `Report.Reconciled` says which one ran — because "the check passed"
+  means something different when the cost no longer depends on how much data you have.
+
+See [docs/invariants.md](docs/invariants.md) for what each invariant does **not** cover, and
+[docs/scale.md](docs/scale.md) for the measured costs.
 
 **Testing strategy**: invariants first. Two randomized property tests — one over payment/receipt/settlement (40 seeds × 220 operations), one over refunds
 (25 seeds × 200 operations mixing instalment refunds, deliberate replays of the *same* refund id, and genuine repeat refunds with fresh ids).
@@ -329,9 +356,18 @@ If you want to forbid commercial use, you need a non-OSI license such as PolyFor
 
 ## Contributing
 
-A non-commercial open-source project with no response-time guarantee. Welcome:
+An open-source project maintained in the open, with no response-time guarantee. Welcome:
 
 - ✅ Invariant tests, boundary cases, documentation fixes, new examples
-- ✅ New `Store` implementations — MySQL, PostgreSQL, SQLite, or anything else
-- ✅ New payout channel implementations (WeChat, Alipay, bank transfer)
-- ❌ Adding "game mechanics" to the core (team commissions, regional dividends, chain payouts) — those can only exist as third-party `RateResolver` implementations
+- ✅ New `Store` implementations. The port is deliberately demanding, so a new backend is the best
+  pressure test the design gets — and it is about 100 lines of `Dialect`, not another store
+- ✅ New payout channel implementations (WeChat, Alipay, bank transfer), once withdrawals exist
+- ❌ Adding "game mechanics" to the core (team commissions, regional dividends, chain payouts) — those can
+  only exist as third-party `RateResolver` implementations
+
+Two rules for a change to be mergeable:
+
+1. **`go test ./...` at the repository root must pass without a database.** If your change needs one,
+   the test belongs in `integration/`, which is a separate module for exactly this reason.
+2. **`go.mod` keeps an empty `require` block.** No exceptions: a distribution ledger that drags in a
+   dependency tree is a ledger you cannot audit.

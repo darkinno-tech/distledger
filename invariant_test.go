@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
 )
 
 // TestRandomEventSequencePreservesInvariants is the most important property test.

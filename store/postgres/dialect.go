@@ -23,7 +23,7 @@ import (
 	"strconv"
 	"strings"
 
-	sqlstore "github.com/im10furry/distledger/store/sql"
+	sqlstore "github.com/darkinno-tech/distledger/store/sql"
 )
 
 // Dialect implements sqlstore.Dialect for PostgreSQL 12 and later.

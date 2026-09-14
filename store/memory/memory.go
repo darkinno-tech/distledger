@@ -38,7 +38,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
 )
 
 // idemRef is the composite key of the idempotency index.
