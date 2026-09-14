@@ -111,6 +111,45 @@ func (t *tx) PutAccount(ctx context.Context, a distledger.Account) (distledger.A
 	return a, nil
 }
 
+// IncrementAccount applies a delta under the store's write lock, which is what
+// makes it atomic here: no other transaction can interleave between the read and
+// the write.
+func (t *tx) IncrementAccount(ctx context.Context, delta distledger.AccountDelta) (distledger.Account, error) {
+	if err := ctx.Err(); err != nil {
+		return distledger.Account{}, err
+	}
+	if err := delta.Key.Validate(); err != nil {
+		return distledger.Account{}, err
+	}
+
+	d := t.reader.d
+	acct, existed := d.accounts[delta.Key]
+	// A missing account is created with the delta as its initial values, which is
+	// what makes the caller's "accrue into a fresh account" case work without a
+	// separate create step.
+	acct.Key = delta.Key
+
+	updated, err := delta.Apply(acct)
+	if err != nil {
+		return distledger.Account{}, err
+	}
+	if delta.RequireNonNegative {
+		if bad := updated.NegativeBuckets(); len(bad) > 0 {
+			return distledger.Account{}, fmt.Errorf(
+				"%w: applying %s would leave the %s bucket negative",
+				distledger.ErrInsufficientBalance, delta.Key, bad[0])
+		}
+	}
+
+	saveAccount(t.u, d, delta.Key)
+	if !existed {
+		insertAccountID(d, t.u, delta.Key)
+	}
+	updated.Version++
+	d.accounts[delta.Key] = updated
+	return updated, nil
+}
+
 func (t *tx) AppendCommission(ctx context.Context, c distledger.Commission) (distledger.Commission, error) {
 	if err := ctx.Err(); err != nil {
 		return c, err

@@ -196,8 +196,40 @@ type Writer interface {
 	// PutBinding saves a binding; a Version mismatch returns ErrConflict.
 	PutBinding(ctx context.Context, b Binding) (Binding, error)
 
-	// PutAccount saves an account; a Version mismatch returns ErrConflict.
+	// PutAccount saves an account, replacing every balance with the given values;
+	// a Version mismatch returns ErrConflict.
+	//
+	// It models an ADMINISTRATIVE adjustment: an operator setting a balance to a
+	// specific figure during a reconciliation or a data migration. That is also
+	// exactly the shape of the corruption invariant I1 exists to catch - someone
+	// changed the balance and forgot the ledger - which is why the self check
+	// tests inject their corruption through it.
+	//
+	// The engine's own money movements do NOT go through here. They go through
+	// IncrementAccount. The difference is the meaning: PutAccount says "I believe
+	// the current value is this, set it to that", while IncrementAccount says
+	// "whatever it currently is, add this" - and only the latter is what accrual
+	// and settlement actually need.
 	PutAccount(ctx context.Context, a Account) (Account, error)
+
+	// IncrementAccount applies a set of bucket deltas atomically and returns the
+	// updated account.
+	//
+	// # Why it has to be atomic
+	//
+	// Read-modify-write does not hold up on a hot account. When many orders belong
+	// to one popular agent, optimistic locking makes all but one of them fail and
+	// retry the whole event. A delta lets the database serialise them with a row
+	// lock: no version conflict, no retry, and no way for a concurrent write to be
+	// silently overwritten.
+	//
+	// A missing account is created, with the delta as its initial values.
+	//
+	// When delta.RequireNonNegative is set and any bucket would end up negative,
+	// the call returns ErrInsufficientBalance and changes nothing. That guard has
+	// to live inside the same statement: checking and then writing is two
+	// statements, and another writer can get in between them.
+	IncrementAccount(ctx context.Context, delta AccountDelta) (Account, error)
 
 	// AppendCommission appends a commission; an idempotency key conflict
 	// returns ErrDuplicate. It returns the persisted entity (with the assigned

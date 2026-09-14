@@ -367,6 +367,108 @@ func (t *tx) lookupAccount(ctx context.Context, key distledger.UserKey) (distled
 	return out, found, err
 }
 
+// IncrementAccount applies a delta in one statement.
+//
+// # Why one statement and not read-modify-write
+//
+// Two orders attributed to the same popular agent arrive together. With a
+// read-modify-write they both read the same balances, both compute new ones, and
+// one of them loses the version check and has to retry the whole event. With an
+// increment the database serialises them on the row lock and neither has to know
+// the other exists.
+//
+// # The guard travels with the statement
+//
+// RequireNonNegative is expressed as additional predicates on the same UPDATE, so
+// a change that would push a bucket below zero simply matches no row. Checking in
+// Go and then writing would leave a window for another writer between the two.
+func (t *tx) IncrementAccount(ctx context.Context, delta distledger.AccountDelta) (distledger.Account, error) {
+	if err := delta.Key.Validate(); err != nil {
+		return distledger.Account{}, err
+	}
+	if delta.IsZero() {
+		acct, _, err := t.lookupAccount(ctx, delta.Key)
+		return acct, err
+	}
+
+	// The update is attempted first, because a missing account is the rarer case
+	// and a mismatch tells us which case we are in.
+	b := t.b()
+	update := "UPDATE " + t.table("dist_account") + " SET " +
+		t.cols("frozen") + " = " + t.cols("frozen") + " + " + b.add(delta.Frozen) + ", " +
+		t.cols("available") + " = " + t.cols("available") + " + " + b.add(delta.Available) + ", " +
+		t.cols("withdrawing") + " = " + t.cols("withdrawing") + " + " + b.add(delta.Withdrawing) + ", " +
+		t.cols("withdrawn") + " = " + t.cols("withdrawn") + " + " + b.add(delta.Withdrawn) + ", " +
+		t.cols("total_earned") + " = " + t.cols("total_earned") + " + " + b.add(delta.TotalEarned) + ", " +
+		t.cols("total_reversed") + " = " + t.cols("total_reversed") + " + " + b.add(delta.TotalReversed) + ", " +
+		t.cols("version") + " = " + t.cols("version") + " + 1" +
+		" WHERE " + t.cols("tenant_id") + " = " + b.add(delta.Key.TenantID) +
+		" AND " + t.cols("user_id") + " = " + b.add(delta.Key.UserID)
+	if delta.RequireNonNegative {
+		// Each bucket's post-state must be non-negative. Writing it as a
+		// predicate is what makes the guard part of the same atomic statement.
+		update += " AND " + t.cols("frozen") + " + " + b.add(delta.Frozen) + " >= 0" +
+			" AND " + t.cols("available") + " + " + b.add(delta.Available) + " >= 0" +
+			" AND " + t.cols("withdrawing") + " + " + b.add(delta.Withdrawing) + " >= 0" +
+			" AND " + t.cols("withdrawn") + " + " + b.add(delta.Withdrawn) + " >= 0"
+	}
+
+	res, err := t.updateVersioned(ctx, update, b.vals)
+	if err != nil {
+		return distledger.Account{}, err
+	}
+	if res.affected == 1 {
+		acct, _, err := t.lookupAccount(ctx, delta.Key)
+		return acct, err
+	}
+
+	_, found, err := t.lookupAccount(ctx, delta.Key)
+	if err != nil {
+		return distledger.Account{}, err
+	}
+	if found {
+		// The row exists, so the guard is what rejected the update.
+		return distledger.Account{}, fmt.Errorf(
+			"%w: applying %s would leave a bucket of account %s negative",
+			distledger.ErrInsufficientBalance, delta.Key, delta.Key)
+	}
+
+	// No account yet: create it from the delta itself.
+	seed, err := delta.Apply(distledger.Account{Key: delta.Key})
+	if err != nil {
+		return distledger.Account{}, err
+	}
+	if delta.RequireNonNegative {
+		if bad := seed.NegativeBuckets(); len(bad) > 0 {
+			return distledger.Account{}, fmt.Errorf(
+				"%w: applying %s would leave the %s bucket negative",
+				distledger.ErrInsufficientBalance, delta.Key, bad[0])
+		}
+	}
+
+	ins := t.b()
+	insert := "INSERT INTO " + t.table("dist_account") + " (" + t.accountCols() + ") VALUES (" +
+		ins.add(seed.Key.TenantID) + ", " + ins.add(seed.Key.UserID) + ", " +
+		ins.add(seed.Frozen) + ", " + ins.add(seed.Available) + ", " +
+		ins.add(seed.Withdrawing) + ", " + ins.add(seed.Withdrawn) + ", " +
+		ins.add(seed.TotalEarned) + ", " + ins.add(seed.TotalReversed) + ", " +
+		ins.add(int64(1)) + ", " + ins.add(instantOrNull(time.Now().UTC())) + ")"
+	inserted, err := t.execInsert(ctx, insert, ins.vals)
+	if err != nil {
+		return distledger.Account{}, fmt.Errorf("sqlstore: insert account: %w", err)
+	}
+	if !inserted {
+		// Another transaction created it between the UPDATE and the INSERT, so
+		// this delta has not been applied yet. Reporting a conflict lets the
+		// caller retry, which the port's retry contract permits.
+		return distledger.Account{}, &distledger.ConflictError{
+			Kind: "account", ID: delta.Key.String(), Expected: 0, Actual: 0,
+		}
+	}
+	seed.Version = 1
+	return seed, nil
+}
+
 // ── Commission ──────────────────────────────────────────────────────────
 
 func (t *tx) AppendCommission(ctx context.Context, c distledger.Commission) (distledger.Commission, error) {

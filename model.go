@@ -469,6 +469,102 @@ func (b Bucket) After(e LedgerEntry) Money {
 	}
 }
 
+// AccountDelta is an atomic change to an account's buckets.
+//
+// # Why this type exists
+//
+// The engine moves money by reading an account, changing two buckets and writing
+// it back with a version check. That is correct but it does not scale: several
+// orders attributed to one popular agent contend on the same account row, and
+// under optimistic locking all but one of them lose and have to retry the whole
+// event.
+//
+// A delta lets the database serialise them with a row lock instead - one atomic
+// statement, no version conflict, no retry, and no way for a concurrent writer to
+// be silently overwritten. The guard travels with the change, so "this must not
+// push a bucket below zero" is enforced by the same statement rather than by a
+// comparison made before it.
+type AccountDelta struct {
+	Key UserKey
+	// Bucket deltas. Positive credits, negative debits.
+	Frozen      Money
+	Available   Money
+	Withdrawing Money
+	Withdrawn   Money
+	// Gross totals. TotalEarned rises with an accrual, TotalReversed with a
+	// clawback.
+	TotalEarned   Money
+	TotalReversed Money
+	// At is the time the change happened, taken from the ledger's clock. It is
+	// part of the delta so that every store stamps the same instant rather than
+	// each calling its own clock.
+	At time.Time
+	// RequireNonNegative rejects the whole change when it would leave any bucket
+	// below zero.
+	//
+	// It is part of the change rather than a separate check because a check and a
+	// write are two statements, and another writer can get in between them. Here
+	// the database refuses the update itself.
+	RequireNonNegative bool
+}
+
+// AddToDelta adds a change to one bucket of the delta. It mirrors Bucket.Set,
+// which does the same for an account, so a caller can address a bucket without
+// naming the struct field.
+func (b Bucket) AddToDelta(d *AccountDelta, v Money) {
+	switch b {
+	case BucketFrozen:
+		d.Frozen += v
+	case BucketAvailable:
+		d.Available += v
+	case BucketWithdrawing:
+		d.Withdrawing += v
+	case BucketWithdrawn:
+		d.Withdrawn += v
+	}
+}
+
+// Apply returns a copy of a with the delta applied, or ErrOverflow.
+func (d AccountDelta) Apply(a Account) (Account, error) {
+	var err error
+	if a.Frozen, err = a.Frozen.Add(d.Frozen); err != nil {
+		return a, err
+	}
+	if a.Available, err = a.Available.Add(d.Available); err != nil {
+		return a, err
+	}
+	if a.Withdrawing, err = a.Withdrawing.Add(d.Withdrawing); err != nil {
+		return a, err
+	}
+	if a.Withdrawn, err = a.Withdrawn.Add(d.Withdrawn); err != nil {
+		return a, err
+	}
+	if a.TotalEarned, err = a.TotalEarned.Add(d.TotalEarned); err != nil {
+		return a, err
+	}
+	if a.TotalReversed, err = a.TotalReversed.Add(d.TotalReversed); err != nil {
+		return a, err
+	}
+	return a, nil
+}
+
+// IsZero reports whether the delta changes nothing.
+func (d AccountDelta) IsZero() bool {
+	return d.Frozen == 0 && d.Available == 0 && d.Withdrawing == 0 &&
+		d.Withdrawn == 0 && d.TotalEarned == 0 && d.TotalReversed == 0
+}
+
+// NegativeBuckets names the buckets that would end up below zero.
+func (a Account) NegativeBuckets() []Bucket {
+	var out []Bucket
+	for _, b := range AllBuckets() {
+		if b.Value(a) < 0 {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
 // Settleable reports whether every balance bucket is non-negative.
 //
 // It walks the shared bucket definition rather than naming fields, so it cannot

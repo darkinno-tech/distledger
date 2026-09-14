@@ -336,23 +336,18 @@ func (l *Ledger) accrueBase(ctx context.Context, tx Tx, ev OrderPaidEvent, base 
 func (l *Ledger) creditAccrual(ctx context.Context, tx Tx, c Commission, now time.Time) error {
 	key := UserKey{TenantID: c.Key.TenantID, UserID: c.AgentUserID}
 
-	acct, err := tx.Account(ctx, key)
-	if err != nil {
-		return err
-	}
-	// When the account does not exist, Account returns a zero value whose Key
-	// is empty, so the Key must be filled in explicitly.
-	acct.Key = key
-
-	if acct.Frozen, err = acct.Frozen.Add(c.Amount); err != nil {
-		return err
-	}
-	if acct.TotalEarned, err = acct.TotalEarned.Add(c.Amount); err != nil {
-		return err
-	}
-	acct.UpdatedAt = now
-
-	saved, err := tx.PutAccount(ctx, acct)
+	// One atomic increment instead of read-modify-write.
+	//
+	// The difference matters on a hot account: many orders attributed to one
+	// popular agent would otherwise all read the same balances, and all but one
+	// would lose the version check and have to retry the whole event. A delta
+	// leaves the serialisation to the database's row lock.
+	saved, err := tx.IncrementAccount(ctx, AccountDelta{
+		Key:         key,
+		Frozen:      c.Amount,
+		TotalEarned: c.Amount,
+		At:          now,
+	})
 	if err != nil {
 		return err
 	}

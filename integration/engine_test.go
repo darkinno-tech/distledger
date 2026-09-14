@@ -488,3 +488,82 @@ func assertSelfCheckOK(t *testing.T, ctx context.Context, led *distledger.Ledger
 }
 
 var _ = fmt.Sprintf
+
+// TestEngineConcurrentOrdersToOneAgent is the reason account movements became
+// atomic increments.
+//
+// Every order in this test is attributed to the SAME agent, so they all contend
+// on one account row. Under the read-modify-write form that preceded the delta
+// API, each transaction read the same balances and all but one lost the version
+// check, so the caller saw conflicts and had to retry whole events.
+//
+// With an increment the database serialises them on the row lock: every order
+// succeeds, nothing conflicts, and the final balance is exactly the sum. The
+// assertion is therefore not just "no error" but "the arithmetic is exact",
+// because a lost update would show up as a shortfall rather than as a failure.
+func TestEngineConcurrentOrdersToOneAgent(t *testing.T) {
+	for _, b := range backends(t) {
+		t.Run(b.name, func(t *testing.T) {
+			ctx := context.Background()
+			led, clock := newEngine(t, b)
+
+			if _, err := led.BindAgent(ctx, distledger.BindAgentRequest{
+				TenantID: engineTenant, UserID: 3001, Status: distledger.AgentActive,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := led.BindBuyer(ctx, distledger.BindBuyerRequest{
+				TenantID: engineTenant, BuyerUserID: 4001, AgentUserID: 3001,
+				Source: distledger.SourceLink,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			const orders = 12
+			paidAt := clock.Now()
+			var (
+				accrued int64
+				failed  int64
+			)
+			done := make(chan struct{}, orders)
+			for i := 0; i < orders; i++ {
+				go func(n int) {
+					defer func() { done <- struct{}{} }()
+					res, err := led.OnOrderPaid(ctx, distledger.OrderPaidEvent{
+						TenantID:    engineTenant,
+						OrderID:     fmt.Sprintf("ORD-%02d", n),
+						BuyerUserID: 4001,
+						PaidAmount:  10000, // 5% at level 1 -> 500 per order
+						PaidAt:      paidAt,
+					})
+					if err != nil {
+						atomic.AddInt64(&failed, 1)
+						return
+					}
+					atomic.AddInt64(&accrued, int64(len(res.Commissions)))
+				}(i)
+			}
+			for i := 0; i < orders; i++ {
+				<-done
+			}
+
+			if failed != 0 {
+				t.Fatalf("%d of %d orders failed; concurrent writers must not conflict", failed, orders)
+			}
+			if accrued != orders {
+				t.Fatalf("%d commissions accrued, want %d", accrued, orders)
+			}
+
+			bal, err := led.Balance(ctx, engineTenant, 3001)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := distledger.Money(orders * 500)
+			if bal.Frozen != want {
+				t.Fatalf("frozen = %s, want %s: a concurrent increment was lost",
+					bal.Frozen, want)
+			}
+			assertSelfCheckOK(t, ctx, led, engineTenant)
+		})
+	}
+}

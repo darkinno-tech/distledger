@@ -292,25 +292,18 @@ func (l *Ledger) settleOne(ctx context.Context, tx Tx, c Commission, outstanding
 	}
 
 	key := UserKey{TenantID: c.Key.TenantID, UserID: c.AgentUserID}
-	acct, err := tx.Account(ctx, key)
-	if err != nil {
-		return false, err
-	}
-	acct.Key = key
 
-	if acct.Frozen < outstanding {
-		return false, fmt.Errorf("%w: account %s frozen balance %s is less than commission %s",
-			ErrInsufficientBalance, key, acct.Frozen, outstanding)
-	}
-	if acct.Frozen, err = acct.Frozen.Sub(outstanding); err != nil {
-		return false, err
-	}
-	if acct.Available, err = acct.Available.Add(outstanding); err != nil {
-		return false, err
-	}
-	acct.UpdatedAt = now
-
-	saved, err := tx.PutAccount(ctx, acct)
+	// Moving money between buckets is an atomic delta, and the "the frozen
+	// bucket must cover this" guard is a predicate on the same statement rather
+	// than a comparison made before it. A guard written in Go would have a window
+	// between the check and the write for another settlement to slip through.
+	saved, err := tx.IncrementAccount(ctx, AccountDelta{
+		Key:                key,
+		Frozen:             -outstanding,
+		Available:          outstanding,
+		RequireNonNegative: true,
+		At:                 now,
+	})
 	if err != nil {
 		return false, err
 	}

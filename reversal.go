@@ -3,7 +3,6 @@ package distledger
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sort"
 	"strconv"
 	"time"
@@ -488,36 +487,24 @@ func (l *Ledger) debitBucket(
 	at time.Time,
 ) error {
 	key := UserKey{TenantID: original.Key.TenantID, UserID: original.AgentUserID}
-	acct, err := tx.Account(ctx, key)
-	if err != nil {
-		return err
-	}
-	acct.Key = key
 
-	// An insufficient balance returns an error instead of pushing the bucket
-	// negative: a negative balance would break invariant I1, and an account that
-	// "reads as negative" is far harder to clean up than one failed clawback.
+	// An insufficient balance must not push the bucket negative: a negative
+	// balance would break invariant I1, and an account that "reads as negative"
+	// is far harder to clean up than one failed clawback. RequireNonNegative
+	// makes that a guard on the statement itself.
 	//
 	// In v0.3 this path is unreachable - with no withdrawals the money is always
 	// still in the bucket. It is a safety net for v0.5, where a commission can be
 	// paid out before its order is refunded.
-	current := bucket.Value(acct)
-	if current < delta {
-		return fmt.Errorf("%w: %s balance %s is less than the clawback %s",
-			ErrInsufficientBalance, bucket, current, delta)
+	clawback := AccountDelta{
+		Key:                key,
+		TotalReversed:      delta,
+		RequireNonNegative: true,
+		At:                 at,
 	}
-	next, err := current.Sub(delta)
-	if err != nil {
-		return err
-	}
-	bucket.Set(&acct, next)
+	bucket.AddToDelta(&clawback, -delta)
 
-	if acct.TotalReversed, err = acct.TotalReversed.Add(delta); err != nil {
-		return err
-	}
-	acct.UpdatedAt = at
-
-	saved, err := tx.PutAccount(ctx, acct)
+	saved, err := tx.IncrementAccount(ctx, clawback)
 	if err != nil {
 		return err
 	}
