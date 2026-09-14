@@ -285,19 +285,15 @@ func (l *Ledger) settleOne(ctx context.Context, tx Tx, c Commission, outstanding
 		return false, err
 	}
 
-	if _, err := tx.AppendLedger(ctx, LedgerEntry{
-		Key:              key,
-		BizType:          LedgerSettle,
-		BizID:            strconv.FormatInt(c.ID, 10),
-		DeltaFrozen:      -outstanding,
-		DeltaAvailable:   outstanding,
-		AfterFrozen:      saved.Frozen,
-		AfterAvailable:   saved.Available,
-		AfterWithdrawing: saved.Withdrawing,
-		AfterWithdrawn:   saved.Withdrawn,
-		Remark:           "settle order " + c.Key.OrderID + " layer " + strconv.Itoa(c.Layer),
-		CreatedAt:        now,
-	}); err != nil {
+	// Settling moves money between two buckets, so both deltas have to be
+	// recorded. That is the one case newLedgerEntry cannot express alone.
+	entry := newLedgerEntry(
+		key, LedgerSettle, strconv.FormatInt(c.ID, 10),
+		"settle order "+c.Key.OrderID+" layer "+strconv.Itoa(c.Layer),
+		now, saved, BucketFrozen, -outstanding,
+	)
+	BucketAvailable.AddDelta(&entry, outstanding)
+	if _, err := tx.AppendLedger(ctx, entry); err != nil {
 		return false, err
 	}
 	return true, nil

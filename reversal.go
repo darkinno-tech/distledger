@@ -464,15 +464,13 @@ func (l *Ledger) clawBack(
 	// Pending and risk-frozen commissions keep their money in Frozen; settled
 	// ones keep it in Available. The bucket is chosen from the state the
 	// commission was in, never from current configuration.
-	kind, err := reversalBucket(original.State)
+	bucket, err := reversalBucket(original.State)
 	if err != nil {
 		return Commission{}, err
 	}
-	effect, err := l.debitBucket(ctx, tx, original, kind, delta, reason, reversal.ID, target, cur.Amount, at)
-	if err != nil {
+	if err := l.debitBucket(ctx, tx, original, bucket, delta, reason, reversal.ID, target, cur.Amount, at); err != nil {
 		return Commission{}, err
 	}
-	_ = effect
 	return reversal, nil
 }
 
@@ -482,110 +480,76 @@ func (l *Ledger) debitBucket(
 	ctx context.Context,
 	tx Tx,
 	original Commission,
-	kind reversalBucketKind,
+	bucket Bucket,
 	delta Money,
 	reason string,
 	reversalID int64,
 	target, originalAmount Money,
 	at time.Time,
-) (bucketEffect, error) {
+) error {
 	key := UserKey{TenantID: original.Key.TenantID, UserID: original.AgentUserID}
 	acct, err := tx.Account(ctx, key)
 	if err != nil {
-		return bucketEffect{}, err
+		return err
 	}
 	acct.Key = key
 
-	effect, err := kind.apply(&acct, delta)
-	if err != nil {
-		return bucketEffect{}, fmt.Errorf("%w: %v", ErrInsufficientBalance, err)
+	// An insufficient balance returns an error instead of pushing the bucket
+	// negative: a negative balance would break invariant I1, and an account that
+	// "reads as negative" is far harder to clean up than one failed clawback.
+	//
+	// In v0.3 this path is unreachable - with no withdrawals the money is always
+	// still in the bucket. It is a safety net for v0.5, where a commission can be
+	// paid out before its order is refunded.
+	current := bucket.Value(acct)
+	if current < delta {
+		return fmt.Errorf("%w: %s balance %s is less than the clawback %s",
+			ErrInsufficientBalance, bucket, current, delta)
 	}
+	next, err := current.Sub(delta)
+	if err != nil {
+		return err
+	}
+	bucket.Set(&acct, next)
+
 	if acct.TotalReversed, err = acct.TotalReversed.Add(delta); err != nil {
-		return bucketEffect{}, err
+		return err
 	}
 	acct.UpdatedAt = at
 
 	saved, err := tx.PutAccount(ctx, acct)
 	if err != nil {
-		return bucketEffect{}, err
+		return err
 	}
 
 	bizType := LedgerReverse
 	if reason == reasonVoid {
 		bizType = LedgerVoid
 	}
-	_, err = tx.AppendLedger(ctx, LedgerEntry{
-		Key:              key,
-		BizType:          bizType,
-		BizID:            strconv.FormatInt(reversalID, 10),
-		DeltaFrozen:      effect.deltaFrozen,
-		DeltaAvailable:   effect.deltaAvailable,
-		AfterFrozen:      saved.Frozen,
-		AfterAvailable:   saved.Available,
-		AfterWithdrawing: saved.Withdrawing,
-		AfterWithdrawn:   saved.Withdrawn,
-		Remark: reason + " order " + original.Key.OrderID +
-			" layer " + strconv.Itoa(original.Layer) +
-			" (reversed " + target.String() + " of " + originalAmount.String() + ")",
-		CreatedAt: at,
-	})
-	return effect, err
+	_, err = tx.AppendLedger(ctx, newLedgerEntry(
+		key, bizType, strconv.FormatInt(reversalID, 10),
+		reason+" order "+original.Key.OrderID+
+			" layer "+strconv.Itoa(original.Layer)+
+			" (reversed "+target.String()+" of "+originalAmount.String()+")",
+		at, saved, bucket, -delta,
+	))
+	return err
 }
 
-// reversalBucketKind says which bucket a clawback should draw from.
-type reversalBucketKind uint8
-
-const (
-	bucketFrozen reversalBucketKind = iota
-	bucketAvailable
-)
-
-type bucketEffect struct {
-	deltaFrozen    Money
-	deltaAvailable Money
-}
-
-func reversalBucket(state CommissionState) (reversalBucketKind, error) {
+// reversalBucket says which bucket a clawback should draw from.
+//
+// It returns the shared Bucket type rather than a private enum of its own: a
+// parallel "which bucket" type is one more place where a newly added bucket can
+// be forgotten.
+func reversalBucket(state CommissionState) (Bucket, error) {
 	switch state {
 	case CommissionPending, CommissionFrozen:
-		return bucketFrozen, nil
+		return BucketFrozen, nil
 	case CommissionSettled:
-		return bucketAvailable, nil
+		return BucketAvailable, nil
 	default:
 		return 0, &TransitionError{
 			Kind: "commission clawback", From: state.String(), To: CommissionReversed.String(),
 		}
-	}
-}
-
-// apply debits the chosen bucket and returns the deltas the ledger entry needs.
-//
-// An insufficient balance returns an error instead of pushing the bucket
-// negative: a negative balance would break invariant I1, and an account that
-// "reads as negative" is far harder to clean up than one failed clawback.
-// In v0.3 this path is unreachable — with no withdrawals the money is always
-// still in the bucket. It is a safety net for v0.5, where a commission can be
-// paid out before the order is refunded.
-func (k reversalBucketKind) apply(acct *Account, amount Money) (bucketEffect, error) {
-	var err error
-	switch k {
-	case bucketFrozen:
-		if acct.Frozen < amount {
-			return bucketEffect{}, fmt.Errorf(
-				"frozen balance %s is less than the clawback %s", acct.Frozen, amount)
-		}
-		if acct.Frozen, err = acct.Frozen.Sub(amount); err != nil {
-			return bucketEffect{}, err
-		}
-		return bucketEffect{deltaFrozen: -amount}, nil
-	default:
-		if acct.Available < amount {
-			return bucketEffect{}, fmt.Errorf(
-				"available balance %s is less than the clawback %s", acct.Available, amount)
-		}
-		if acct.Available, err = acct.Available.Sub(amount); err != nil {
-			return bucketEffect{}, err
-		}
-		return bucketEffect{deltaAvailable: -amount}, nil
 	}
 }

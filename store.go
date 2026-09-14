@@ -243,6 +243,18 @@ type Tx interface {
 // function must therefore have no side effects outside the transaction (no
 // message publishing, no external calls, no mutation of variables from the
 // enclosing closure).
+//
+// "Retry" means exactly this, and nothing weaker:
+//
+//  1. the failed attempt is rolled back completely, and
+//  2. the function is invoked again against the state as it was BEFORE that
+//     attempt.
+//
+// Retrying without rolling back first is not permitted. It would expose the
+// function to its own partial effects, so a half-applied step would look like
+// pre-existing state on the second run. The engine depends on this: settling a
+// commission moves its state and then debits the account, and running that again
+// is only safe because the first attempt left nothing behind.
 type Store interface {
 	// View runs fn in a read-only transaction. fn must not call Update/View (it
 	// would deadlock or return an error).

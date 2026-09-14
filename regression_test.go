@@ -128,19 +128,22 @@ func TestQuarantineDoesNotBlockHealthySettlement(t *testing.T) {
 	f.mustPay("ORD-1", 4001, 100000)
 	f.receive("ORD-1", f.clock.Now())
 
-	// Inject a pending commission with no outstanding amount: unreachable
-	// through the public API, so it stands in for a corrupted row.
+	// Inject a pending commission that has nothing left to settle: it claims to
+	// be fully clawed back yet is still waiting to settle. The engine never
+	// produces that combination, which is exactly what makes it a good stand-in
+	// for a corrupted row.
 	ctx := context.Background()
 	if err := f.store.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
 		_, err := tx.AppendCommission(ctx, distledger.Commission{
-			Key:         distledger.OrderKey{TenantID: tenant, OrderID: "ORD-BAD"},
-			IdemKey:     "corrupt-row",
-			AgentUserID: 3001,
-			Layer:       1,
-			BaseAmount:  0,
-			Amount:      0,
-			State:       distledger.CommissionPending,
-			AvailableAt: f.clock.Now().Add(-time.Hour),
+			Key:            distledger.OrderKey{TenantID: tenant, OrderID: "ORD-BAD"},
+			IdemKey:        "corrupt-row",
+			AgentUserID:    3001,
+			Layer:          1,
+			BaseAmount:     10000,
+			Amount:         10000,
+			ReversedAmount: 10000,
+			State:          distledger.CommissionPending,
+			AvailableAt:    f.clock.Now().Add(-time.Hour),
 		})
 		return err
 	}); err != nil {
@@ -420,5 +423,105 @@ func TestSetCommissionReversedAmountRejectsOutOfRange(t *testing.T) {
 	})
 	if !errors.Is(err, distledger.ErrInvalidArgument) {
 		t.Fatalf("expected ErrInvalidArgument for a negative accumulator, got %v", err)
+	}
+}
+
+// TestUnallocatedBaseIsReported pins the fix for a silently smaller payout.
+//
+// Items define the commissionable base per line, so a total below the paid
+// amount is legitimate. Before UnallocatedBase existed, forgetting an item
+// produced a smaller commission with no signal at all: the caller saw a
+// successful accrual and the difference was invisible.
+func TestUnallocatedBaseIsReported(t *testing.T) {
+	f := newFixture(t, distledger.Rules{Levels: 1, RateBP: []distledger.Rate{1000}})
+	f.mustAgent(3001, 0, distledger.AgentActive)
+	f.mustBuyer(4001, 3001)
+
+	res, err := f.led.OnOrderPaid(context.Background(), distledger.OrderPaidEvent{
+		TenantID: tenant, OrderID: "ORD-1", BuyerUserID: 4001,
+		PaidAmount: 100000, PaidAt: f.clock.Now(),
+		Items: []distledger.OrderItem{
+			{ItemID: "SKU-A", Amount: 30000},
+			{ItemID: "SKU-B", Amount: 20000},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.UnallocatedBase != 50000 {
+		t.Fatalf("unallocated base = %s, want 50.00", res.UnallocatedBase)
+	}
+	// The commission is still based on the declared items, not on PaidAmount:
+	// one commission per item, 10% of each item's base.
+	if len(res.Commissions) != 2 {
+		t.Fatalf("got %d commissions, want one per item", len(res.Commissions))
+	}
+	total, err := res.AccruedAmount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5000 {
+		t.Fatalf("accrued %s, want 50.00 (10%% of the declared 500.00)", total)
+	}
+
+	// A fully itemised order reports no gap.
+	full, err := f.led.OnOrderPaid(context.Background(), distledger.OrderPaidEvent{
+		TenantID: tenant, OrderID: "ORD-2", BuyerUserID: 4001,
+		PaidAmount: 100000, PaidAt: f.clock.Now(),
+		Items: []distledger.OrderItem{{ItemID: "SKU-A", Amount: 100000}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.UnallocatedBase != 0 {
+		t.Fatalf("unallocated base = %s, want 0 for a fully itemised order", full.UnallocatedBase)
+	}
+}
+
+// TestCommissionSignAndLinkMustAgree pins the store-level guard that stops a
+// caller from injecting rows the engine can neither interpret nor reconcile.
+func TestCommissionSignAndLinkMustAgree(t *testing.T) {
+	f := newFixture(t, distledger.Rules{Levels: 1, RateBP: []distledger.Rate{1000}})
+	ctx := context.Background()
+	base := distledger.Commission{
+		Key:         distledger.OrderKey{TenantID: tenant, OrderID: "ORD-1"},
+		IdemKey:     "k",
+		AgentUserID: 3001,
+		Layer:       1,
+		BaseAmount:  10000,
+		State:       distledger.CommissionPending,
+	}
+
+	cases := map[string]func(*distledger.Commission){
+		"zero amount":           func(c *distledger.Commission) { c.Amount = 0 },
+		"negative without link": func(c *distledger.Commission) { c.Amount = -100 },
+		"accrual with a link":   func(c *distledger.Commission) { c.Amount = 100; c.ReverseOf = 7 },
+		"negative link value":   func(c *distledger.Commission) { c.Amount = 100; c.ReverseOf = -1 },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := base
+			mutate(&c)
+			err := f.store.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
+				_, err := tx.AppendCommission(ctx, c)
+				return err
+			})
+			if !errors.Is(err, distledger.ErrInvalidArgument) {
+				t.Fatalf("got %v, want ErrInvalidArgument", err)
+			}
+		})
+	}
+
+	// A negative record WITH a link is exactly what a reversal looks like, and
+	// must be accepted.
+	ok := base
+	ok.IdemKey = "reversal"
+	ok.Amount = -100
+	ok.ReverseOf = 1
+	if err := f.store.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
+		_, err := tx.AppendCommission(ctx, ok)
+		return err
+	}); err != nil {
+		t.Fatalf("a well-formed reversal record was rejected: %v", err)
 	}
 }

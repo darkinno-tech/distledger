@@ -155,14 +155,21 @@ func (l *Ledger) checkLedgerConservation(ctx context.Context, r Reader, tenantID
 			res.Checked++
 
 			if !acct.Settleable() {
-				res.add("account %s has negative bucket: frozen=%s available=%s withdrawing=%s withdrawn=%s",
-					acct.Key, acct.Frozen, acct.Available, acct.Withdrawing, acct.Withdrawn)
+				for _, b := range AllBuckets() {
+					if v := b.Value(acct); v < 0 {
+						res.add("account %s has a negative %s bucket: %s", acct.Key, b, v)
+					}
+				}
 			}
 
+			// Walk the shared bucket definition rather than naming the four
+			// fields. Hand-written enumeration is how a newly added money field
+			// ends up outside every invariant while the ledger still balances.
+			buckets := AllBuckets()
+			sums := make(map[Bucket]Money, len(buckets))
 			var (
-				sumFrozen, sumAvailable, sumWithdrawing, sumWithdrawn Money
-				last                                                  LedgerEntry
-				entries                                               int
+				last    LedgerEntry
+				entries int
 			)
 			var afterID int64
 			for {
@@ -179,17 +186,12 @@ func (l *Ledger) checkLedgerConservation(ctx context.Context, r Reader, tenantID
 					afterID = e.ID
 					last = e
 					entries++
-					if sumFrozen, err = sumFrozen.Add(e.DeltaFrozen); err != nil {
-						return res, err
-					}
-					if sumAvailable, err = sumAvailable.Add(e.DeltaAvailable); err != nil {
-						return res, err
-					}
-					if sumWithdrawing, err = sumWithdrawing.Add(e.DeltaWithdrawing); err != nil {
-						return res, err
-					}
-					if sumWithdrawn, err = sumWithdrawn.Add(e.DeltaWithdrawn); err != nil {
-						return res, err
+					for _, b := range buckets {
+						sum, err := sums[b].Add(b.Delta(e))
+						if err != nil {
+							return res, err
+						}
+						sums[b] = sum
 					}
 				}
 				if len(page) < MaxPageLimit {
@@ -200,26 +202,23 @@ func (l *Ledger) checkLedgerConservation(ctx context.Context, r Reader, tenantID
 			if entries == 0 {
 				// An account with no ledger entries must be all zeros:
 				// accounts can only come into being driven by ledger entries.
-				if acct.Frozen != 0 || acct.Available != 0 || acct.Withdrawing != 0 || acct.Withdrawn != 0 {
-					res.add("account %s has balances %s/%s/%s/%s but no ledger entries",
-						acct.Key, acct.Frozen, acct.Available, acct.Withdrawing, acct.Withdrawn)
+				for _, b := range buckets {
+					if v := b.Value(acct); v != 0 {
+						res.add("account %s has %s=%s but no ledger entries", acct.Key, b, v)
+					}
 				}
 				continue
 			}
 
-			if sumFrozen != acct.Frozen || sumAvailable != acct.Available ||
-				sumWithdrawing != acct.Withdrawing || sumWithdrawn != acct.Withdrawn {
-				res.add("account %s mismatch: ledger sums %s/%s/%s/%s vs account %s/%s/%s/%s",
-					acct.Key,
-					sumFrozen, sumAvailable, sumWithdrawing, sumWithdrawn,
-					acct.Frozen, acct.Available, acct.Withdrawing, acct.Withdrawn)
-			}
-			if last.AfterFrozen != acct.Frozen || last.AfterAvailable != acct.Available ||
-				last.AfterWithdrawing != acct.Withdrawing || last.AfterWithdrawn != acct.Withdrawn {
-				res.add("account %s tail mismatch: last ledger entry #%d recorded %s/%s/%s/%s, account is %s/%s/%s/%s",
-					acct.Key, last.ID,
-					last.AfterFrozen, last.AfterAvailable, last.AfterWithdrawing, last.AfterWithdrawn,
-					acct.Frozen, acct.Available, acct.Withdrawing, acct.Withdrawn)
+			for _, b := range buckets {
+				if sums[b] != b.Value(acct) {
+					res.add("account %s mismatch on %s: ledger deltas sum to %s but the account holds %s",
+						acct.Key, b, sums[b], b.Value(acct))
+				}
+				if after := b.After(last); after != b.Value(acct) {
+					res.add("account %s tail mismatch on %s: last ledger entry #%d recorded %s but the account holds %s",
+						acct.Key, b, last.ID, after, b.Value(acct))
+				}
 			}
 		}
 		if len(accounts) < MaxPageLimit {

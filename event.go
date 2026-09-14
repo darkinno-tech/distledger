@@ -44,6 +44,15 @@ type OrderPaidEvent struct {
 	// Items is optional. When supplied, commission is computed per line item;
 	// when omitted, the order is commissioned as a whole.
 	Items []OrderItem
+	// OrderID identifies the order and must be unique within the tenant, and
+	// never reused.
+	//
+	// Order-level idempotency is keyed on it, so reusing an id for a genuinely
+	// different order makes the second one look like a replay of the first and it
+	// would be dropped. The buyer check in OnOrderPaid catches reuse across
+	// different buyers; reuse by the same buyer cannot be detected from the event
+	// alone, which is why this is a contract rather than a validation.
+	//
 	// PaidAt is the payment time and is **required**; it decides whether the
 	// binding existed and was effective at the moment of payment.
 	//
@@ -241,9 +250,17 @@ type AccrueResult struct {
 	// Commissions are the commissions **newly created** by this call. Empty on
 	// a duplicate delivery.
 	Commissions []Commission
-	// Replayed reports whether this call hit an idempotent replay (that is, it
-	// was accrued before).
+	// Replayed reports whether this call was recognised as a replay of an
+	// earlier accrual, in which case Commissions is empty.
 	Replayed bool
+	// UnallocatedBase is the part of the paid amount that no order item claimed.
+	//
+	// Items define the commissionable base per line, so a total below the paid
+	// amount is legitimate (shipping, gift lines, goods that carry no
+	// commission). Reporting the gap turns a silently smaller payout into a
+	// number the caller can act on: before this existed, forgetting an item
+	// looked exactly like a successful accrual.
+	UnallocatedBase Money
 	// Skipped explains why each level produced no commission.
 	Skipped []SkipReason
 }

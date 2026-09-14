@@ -357,12 +357,130 @@ type Account struct {
 	UpdatedAt     time.Time
 }
 
-// Settleable reports whether all four money buckets of the account are
-// non-negative.
+// Bucket identifies one of the account's balance buckets.
 //
-// This is part of invariant I1: a negative bucket balance is never allowed.
+// The set is defined in exactly one place, and every check that needs to walk the
+// buckets walks that definition. Before this existed each check enumerated the
+// four fields by hand, which meant a newly added money field silently fell
+// outside every invariant: the ledger still balanced, the self check still
+// passed, and the only wrong thing was the number shown to the distributor.
+//
+// Adding a bucket therefore means adding a case here, and the reflection test in
+// model_test.go fails until the new Account field is classified as either a
+// bucket or an explicitly exempt total.
+type Bucket uint8
+
+const (
+	// BucketFrozen holds accrued commission that has not settled yet.
+	BucketFrozen Bucket = iota
+	// BucketAvailable holds settled commission that can be withdrawn.
+	BucketAvailable
+	// BucketWithdrawing holds money reserved by a pending withdrawal.
+	BucketWithdrawing
+	// BucketWithdrawn holds money already paid out.
+	BucketWithdrawn
+)
+
+var bucketNames = [...]string{"Frozen", "Available", "Withdrawing", "Withdrawn"}
+
+// AllBuckets returns every balance bucket.
+//
+// The result is a copy: callers must not be able to redefine the bucket set.
+func AllBuckets() []Bucket {
+	out := make([]Bucket, len(bucketNames))
+	for i := range bucketNames {
+		out[i] = Bucket(i)
+	}
+	return out
+}
+
+// Valid reports whether the bucket is a known one.
+func (b Bucket) Valid() bool { return int(b) < len(bucketNames) }
+
+// String returns the bucket name, which matches the Account field name. That
+// correspondence is what lets the reflection test check the two against each
+// other.
+func (b Bucket) String() string {
+	if !b.Valid() {
+		return "Bucket(" + i64s(int64(b)) + ")"
+	}
+	return bucketNames[b]
+}
+
+// Value reads the bucket's balance from an account.
+func (b Bucket) Value(a Account) Money {
+	switch b {
+	case BucketFrozen:
+		return a.Frozen
+	case BucketAvailable:
+		return a.Available
+	case BucketWithdrawing:
+		return a.Withdrawing
+	case BucketWithdrawn:
+		return a.Withdrawn
+	default:
+		return 0
+	}
+}
+
+// Set writes the bucket's balance on an account.
+func (b Bucket) Set(a *Account, v Money) {
+	switch b {
+	case BucketFrozen:
+		a.Frozen = v
+	case BucketAvailable:
+		a.Available = v
+	case BucketWithdrawing:
+		a.Withdrawing = v
+	case BucketWithdrawn:
+		a.Withdrawn = v
+	}
+}
+
+// Delta reads the change this ledger entry recorded for the bucket.
+func (b Bucket) Delta(e LedgerEntry) Money {
+	switch b {
+	case BucketFrozen:
+		return e.DeltaFrozen
+	case BucketAvailable:
+		return e.DeltaAvailable
+	case BucketWithdrawing:
+		return e.DeltaWithdrawing
+	case BucketWithdrawn:
+		return e.DeltaWithdrawn
+	default:
+		return 0
+	}
+}
+
+// After reads the post-entry balance this ledger entry recorded for the bucket.
+func (b Bucket) After(e LedgerEntry) Money {
+	switch b {
+	case BucketFrozen:
+		return e.AfterFrozen
+	case BucketAvailable:
+		return e.AfterAvailable
+	case BucketWithdrawing:
+		return e.AfterWithdrawing
+	case BucketWithdrawn:
+		return e.AfterWithdrawn
+	default:
+		return 0
+	}
+}
+
+// Settleable reports whether every balance bucket is non-negative.
+//
+// It walks the shared bucket definition rather than naming fields, so it cannot
+// fall behind when the account grows. This is part of invariant I1: a negative
+// bucket balance is never allowed.
 func (a Account) Settleable() bool {
-	return a.Frozen >= 0 && a.Available >= 0 && a.Withdrawing >= 0 && a.Withdrawn >= 0
+	for _, b := range AllBuckets() {
+		if b.Value(a) < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Refund is the in-library record of one refund instalment for one accrual item.
@@ -493,4 +611,61 @@ type LedgerEntry struct {
 // quickly whether a ledger entry mints money out of thin air.
 func (e LedgerEntry) NetDelta() Money {
 	return e.DeltaFrozen + e.DeltaAvailable + e.DeltaWithdrawing + e.DeltaWithdrawn
+}
+
+// SetAfter records the bucket's post-movement balance on a ledger entry.
+func (b Bucket) SetAfter(e *LedgerEntry, v Money) {
+	switch b {
+	case BucketFrozen:
+		e.AfterFrozen = v
+	case BucketAvailable:
+		e.AfterAvailable = v
+	case BucketWithdrawing:
+		e.AfterWithdrawing = v
+	case BucketWithdrawn:
+		e.AfterWithdrawn = v
+	}
+}
+
+// AddDelta records the bucket's change on a ledger entry.
+func (b Bucket) AddDelta(e *LedgerEntry, v Money) {
+	switch b {
+	case BucketFrozen:
+		e.DeltaFrozen = v
+	case BucketAvailable:
+		e.DeltaAvailable = v
+	case BucketWithdrawing:
+		e.DeltaWithdrawing = v
+	case BucketWithdrawn:
+		e.DeltaWithdrawn = v
+	}
+}
+
+// newLedgerEntry builds a ledger entry for one account movement.
+//
+// Every bucket's post-movement balance is recorded, and the movement itself is
+// applied to the named bucket. Driving both from the shared bucket definition
+// means adding a bucket no longer requires editing three call sites that each
+// hand-wrote the same four field assignments.
+func newLedgerEntry(
+	key UserKey,
+	bizType LedgerBizType,
+	bizID, remark string,
+	at time.Time,
+	after Account,
+	moved Bucket,
+	amount Money,
+) LedgerEntry {
+	e := LedgerEntry{
+		Key:       key,
+		BizType:   bizType,
+		BizID:     bizID,
+		Remark:    remark,
+		CreatedAt: at,
+	}
+	for _, b := range AllBuckets() {
+		b.SetAfter(&e, b.Value(after))
+	}
+	moved.AddDelta(&e, amount)
+	return e
 }

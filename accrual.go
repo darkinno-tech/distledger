@@ -100,9 +100,20 @@ func (l *Ledger) OnOrderPaid(ctx context.Context, ev OrderPaidEvent) (AccrueResu
 					"order %s was already accrued for buyer %d but this event claims buyer %d",
 					ev.OrderID, buyer, ev.BuyerUserID)
 			}
+			// "Attributed with no agent" is not a state the domain has. If the
+			// level-1 record is missing, the data is inconsistent, so say so
+			// rather than returning an impossible pair.
+			agentUserID := layerOneAgent(existing)
 			result.Replayed = true
+			if agentUserID == 0 {
+				result.Skipped = append(result.Skipped, SkipReason{
+					Layer: 1, Code: SkipAgentMissing,
+					Detail: "order has commissions but no level-1 record",
+				})
+				return nil
+			}
 			result.Attributed = true
-			result.AgentUserID = layerOneAgent(existing)
+			result.AgentUserID = agentUserID
 			return nil
 		}
 
@@ -154,10 +165,19 @@ func (l *Ledger) OnOrderPaid(ctx context.Context, ev OrderPaidEvent) (AccrueResu
 			return nil
 		}
 
+		var allocatedBase Money
 		for _, base := range basesOf(ev) {
+			next, err := allocatedBase.Add(base.amount)
+			if err != nil {
+				return err
+			}
+			allocatedBase = next
 			if err := l.accrueBase(ctx, tx, ev, base, first.Key.UserID, &result); err != nil {
 				return err
 			}
+		}
+		if ev.PaidAmount > allocatedBase {
+			result.UnallocatedBase = ev.PaidAmount - allocatedBase
 		}
 		return nil
 	})
@@ -337,17 +357,10 @@ func (l *Ledger) creditAccrual(ctx context.Context, tx Tx, c Commission, now tim
 		return err
 	}
 
-	_, err = tx.AppendLedger(ctx, LedgerEntry{
-		Key:              key,
-		BizType:          LedgerAccrue,
-		BizID:            strconv.FormatInt(c.ID, 10),
-		DeltaFrozen:      c.Amount,
-		AfterFrozen:      saved.Frozen,
-		AfterAvailable:   saved.Available,
-		AfterWithdrawing: saved.Withdrawing,
-		AfterWithdrawn:   saved.Withdrawn,
-		Remark:           "order " + c.Key.OrderID + " layer " + strconv.Itoa(c.Layer),
-		CreatedAt:        now,
-	})
+	_, err = tx.AppendLedger(ctx, newLedgerEntry(
+		key, LedgerAccrue, strconv.FormatInt(c.ID, 10),
+		"order "+c.Key.OrderID+" layer "+strconv.Itoa(c.Layer),
+		now, saved, BucketFrozen, c.Amount,
+	))
 	return err
 }

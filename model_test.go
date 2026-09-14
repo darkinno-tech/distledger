@@ -3,6 +3,7 @@ package distledger
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -532,5 +533,115 @@ func TestIdemKeyLengthsAreBounded(t *testing.T) {
 	ev.IdemKey = strings.Repeat("x", MaxIdemKeyLen)
 	if err := ev.validate(); err != nil {
 		t.Fatalf("key at the length limit must be accepted: %v", err)
+	}
+}
+
+// TestEveryAccountMoneyFieldIsClassified is the structural guard against the
+// failure mode that made TotalEarned invisible to every invariant for a whole
+// release: the checks named their fields by hand, so a new money field silently
+// fell outside them.
+//
+// This test enumerates Account's Money fields through reflection and requires
+// each one to be either a balance bucket or an explicitly exempt total. Adding a
+// field therefore fails the build until someone decides which it is.
+func TestEveryAccountMoneyFieldIsClassified(t *testing.T) {
+	// Totals that are deliberately not buckets, with the reason they are safe.
+	exemptTotals := map[string]string{
+		"TotalEarned":   "gross accrual total, reconciled against commission records by invariant I3",
+		"TotalReversed": "gross reversal total, reconciled against reversal records by invariant I3",
+	}
+
+	buckets := make(map[string]Bucket)
+	for _, b := range AllBuckets() {
+		buckets[b.String()] = b
+	}
+
+	typ := reflect.TypeOf(Account{})
+	moneyType := reflect.TypeOf(Money(0))
+	var classified int
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if field.Type != moneyType {
+			continue
+		}
+		classified++
+		if _, ok := buckets[field.Name]; ok {
+			continue
+		}
+		if reason, ok := exemptTotals[field.Name]; ok {
+			if reason == "" {
+				t.Errorf("Account.%s is exempted from the bucket checks without a reason", field.Name)
+			}
+			continue
+		}
+		t.Errorf("Account.%s is a Money field that is neither a bucket nor an exempt total.\n"+
+			"Either add it as a Bucket case so I1 and Settleable check it, or list it in\n"+
+			"exemptTotals with the invariant that covers it.", field.Name)
+	}
+
+	if classified == 0 {
+		t.Fatal("reflection found no Money fields on Account; the guard is not checking anything")
+	}
+
+	// Every bucket name must correspond to a real field, otherwise Bucket.Value
+	// and Bucket.Set would silently read and write nothing.
+	for _, b := range AllBuckets() {
+		if _, ok := typ.FieldByName(b.String()); !ok {
+			t.Errorf("bucket %s has no matching Account field", b)
+		}
+	}
+}
+
+// TestBucketAccessorsRoundTrip pins that Value/Set/Delta/After are consistent
+// with each other for every bucket.
+func TestBucketAccessorsRoundTrip(t *testing.T) {
+	buckets := AllBuckets()
+	if len(buckets) == 0 {
+		t.Fatal("no buckets defined")
+	}
+	for _, b := range buckets {
+		if !b.Valid() {
+			t.Errorf("bucket %d is not valid", b)
+		}
+
+		var a Account
+		b.Set(&a, 1234)
+		if got := b.Value(a); got != 1234 {
+			t.Errorf("%s: Set then Value = %d, want 1234", b, got)
+		}
+		for _, other := range buckets {
+			if other == b {
+				continue
+			}
+			if got := other.Value(a); got != 0 {
+				t.Errorf("setting %s also changed %s to %d", b, other, got)
+			}
+		}
+
+		e := LedgerEntry{}
+		b.SetAfter(&e, 99)
+		b.AddDelta(&e, -7)
+		if got := b.After(e); got != 99 {
+			t.Errorf("%s: After = %d, want 99", b, got)
+		}
+		if got := b.Delta(e); got != -7 {
+			t.Errorf("%s: Delta = %d, want -7", b, got)
+		}
+	}
+
+	if Bucket(200).Valid() {
+		t.Error("an out-of-range bucket must not be valid")
+	}
+	if got := Bucket(200).String(); got == "" {
+		t.Error("an unknown bucket must still render something for diagnostics")
+	}
+}
+
+// TestAllBucketsReturnsCopy keeps callers from redefining the bucket set.
+func TestAllBucketsReturnsCopy(t *testing.T) {
+	a := AllBuckets()
+	a[0] = Bucket(200)
+	if AllBuckets()[0] == Bucket(200) {
+		t.Fatal("AllBuckets leaked its internal slice")
 	}
 }

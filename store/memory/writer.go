@@ -130,6 +130,19 @@ func (t *tx) AppendCommission(ctx context.Context, c distledger.Commission) (dis
 	if !c.State.Valid() {
 		return c, fieldErrf("state", "unknown commission state %d", uint8(c.State))
 	}
+	// Sign and linkage must agree. An accrual is positive and stands on its own;
+	// a reversal is negative and must point at what it reverses. Allowing a
+	// negative record with no link, or a linked record with a positive amount,
+	// would let a caller inject rows the engine can neither interpret nor
+	// reconcile.
+	switch {
+	case c.Amount == 0:
+		return c, fieldErr("amount", "a zero-amount commission carries no meaning; omit it instead")
+	case c.Amount < 0 && c.ReverseOf <= 0:
+		return c, fieldErr("reverse_of", "a negative commission must reference the accrual it reverses")
+	case c.Amount > 0 && c.ReverseOf != 0:
+		return c, fieldErr("reverse_of", "an accrual must not reference another commission")
+	}
 	if c.ReversedAmount < 0 || c.ReversedAmount > c.MaxReversible() {
 		return c, fieldErrf("reversed_amount",
 			"must be within [0, %s]; got %s", c.MaxReversible(), c.ReversedAmount)
