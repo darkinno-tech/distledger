@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
 )
 
 // Store is the portable SQL implementation of distledger.Store.
@@ -30,6 +30,7 @@ type Store struct {
 var _ distledger.Store = (*Store)(nil)
 var _ distledger.ReportedStore = (*Store)(nil)
 var _ distledger.SchemaChecker = (*Store)(nil)
+var _ distledger.Reconciler = (*Store)(nil)
 
 // Option adjusts a Store at construction time.
 type Option func(*Store)
@@ -241,6 +242,15 @@ func (t *tx) cols(names ...string) string {
 
 // table renders a quoted table name.
 func (t *tx) table(name string) string { return t.s.dialect.Quote(name) }
+
+// qual renders a qualified column reference, such as "a"."user_id".
+//
+// It exists because cols() quotes its whole argument, so passing it "a.user_id"
+// would produce a single identifier containing a dot rather than a reference to
+// a column of an aliased table.
+func (t *tx) qual(alias, col string) string {
+	return t.s.dialect.Quote(alias) + "." + t.s.dialect.Quote(col)
+}
 
 // queryRows runs a query and hands each row to scan, closing the rows.
 func (t *tx) queryRows(ctx context.Context, query string, argv []any, scan func(*sql.Rows) error) error {

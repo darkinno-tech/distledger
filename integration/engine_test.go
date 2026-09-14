@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
 )
 
 // The engine suite.
@@ -580,4 +581,135 @@ func TestEngineConcurrentOrdersToOneAgent(t *testing.T) {
 			assertSelfCheckOK(t, ctx, led, engineTenant)
 		})
 	}
+}
+
+// newEngineAndStore is newEngine plus the store, for tests that need to reach
+// behind the engine to construct a state the engine would never produce.
+func newEngineAndStore(t *testing.T, b backend) (*distledger.Ledger, distledger.Store, *distledger.ManualClock) {
+	t.Helper()
+	store := b.open(t)
+	clock := distledger.NewManualClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	led, err := distledger.New(distledger.Config{
+		Store: store,
+		Clock: clock,
+		Rules: distledger.Rules{
+			Levels:     3,
+			RateBP:     []distledger.Rate{500, 200, 100},
+			FreezeDays: 7,
+		},
+	})
+	if err != nil {
+		t.Fatalf("new ledger: %v", err)
+	}
+	t.Cleanup(func() { _ = led.Close() })
+	return led, store, clock
+}
+
+// TestSelfCheckReconciliationAgreesWithTheRowWiseCheck is the test that makes the
+// set-based reconciliation trustworthy.
+//
+// A reconciling store is only worth having if it agrees with the row-wise check
+// about what is broken. Checking it on a healthy ledger would prove only that it
+// produces no false positives, which a query returning nothing unconditionally
+// would pass too.
+//
+// So the same corruption is injected on every backend, and each must report the
+// same invariant failure. The corruption is written through the store rather than
+// the engine, because the engine would never produce it: that is the point of the
+// invariant. The account row is changed and the ledger is left alone.
+func TestSelfCheckReconciliationAgreesWithTheRowWiseCheck(t *testing.T) {
+	for _, b := range backends(t) {
+		t.Run(b.name, func(t *testing.T) {
+			ctx := context.Background()
+			led, store, clock := newEngineAndStore(t, b)
+
+			if _, err := led.BindAgent(ctx, distledger.BindAgentRequest{
+				TenantID: engineTenant, UserID: 3001, Status: distledger.AgentActive,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := led.BindBuyer(ctx, distledger.BindBuyerRequest{
+				TenantID: engineTenant, BuyerUserID: 4001, AgentUserID: 3001,
+				Source: distledger.SourceLink,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := led.OnOrderPaid(ctx, distledger.OrderPaidEvent{
+				TenantID: engineTenant, OrderID: "ORD-1", BuyerUserID: 4001,
+				PaidAmount: 100000, PaidAt: clock.Now(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			// A healthy ledger must reconcile cleanly, and the check must
+			// actually have inspected something.
+			before, err := led.SelfCheck(ctx, engineTenant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !before.OK {
+				t.Fatalf("a healthy ledger must pass self-check: %+v", before.Invariants)
+			}
+			if before.Reconciled != b.reconciles {
+				t.Fatalf("Reconciled = %v, want %v: the %s store %s take the set-based path",
+					before.Reconciled, b.reconciles, b.name,
+					map[bool]string{true: "must", false: "must not"}[b.reconciles])
+			}
+			i1, ok := findInvariant(before, "I1")
+			if !ok {
+				t.Fatalf("no I1 result in %+v", before.Invariants)
+			}
+			if i1.Checked == 0 {
+				t.Fatal("I1 checked nothing, so passing means nothing")
+			}
+
+			// Change the account row without writing a ledger entry: "someone
+			// edited a balance and forgot the trail".
+			key := distledger.UserKey{TenantID: engineTenant, UserID: 3001}
+			if err := store.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
+				acct, err := tx.Account(ctx, key)
+				if err != nil {
+					return err
+				}
+				acct.Key = key
+				acct.Available += 12345
+				_, err = tx.PutAccount(ctx, acct)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			after, err := led.SelfCheck(ctx, engineTenant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.OK {
+				t.Fatal("self-check passed after the account row was changed behind the ledger's back")
+			}
+			i1, ok = findInvariant(after, "I1")
+			if !ok {
+				t.Fatalf("no I1 result in %+v", after.Invariants)
+			}
+			if i1.OK {
+				t.Fatalf("I1 passed despite the corruption: %+v", i1)
+			}
+			if len(i1.Violations) == 0 {
+				t.Fatalf("I1 failed but recorded no violation, so it cannot be acted on: %+v", i1)
+			}
+			// The violation must name the account, or an operator cannot find it.
+			if !strings.Contains(i1.Violations[0], "u3001") {
+				t.Fatalf("violation %q does not name the offending account", i1.Violations[0])
+			}
+		})
+	}
+}
+
+// findInvariant returns the result whose name starts with prefix.
+func findInvariant(rep distledger.Report, prefix string) (distledger.InvariantResult, bool) {
+	for _, inv := range rep.Invariants {
+		if strings.HasPrefix(inv.Name, prefix) {
+			return inv, true
+		}
+	}
+	return distledger.InvariantResult{}, false
 }

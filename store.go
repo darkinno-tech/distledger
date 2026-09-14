@@ -343,3 +343,66 @@ type ReportedStore interface {
 	// "mysql".
 	StoreKind() string
 }
+
+// AccountReconciliation is one account whose stored state a reconciling store
+// could not confirm is consistent with that account's own ledger entries.
+//
+// It carries the three inputs the conservation check needs — the account row,
+// the sum of its ledger deltas, and its last entry — rather than a verdict. The
+// store decides which accounts are worth reporting; the library decides whether
+// they are actually wrong. That split is deliberate: it keeps one implementation
+// of the check, so a reconciling store and a row-wise one cannot drift into
+// disagreeing about what a violation is.
+type AccountReconciliation struct {
+	// Key identifies the account.
+	Key UserKey
+	// Stored is the account exactly as it is stored.
+	Stored Account
+	// Summed holds, per bucket, the sum of the account's ledger deltas. Only
+	// bucket fields are meaningful; it is an Account so that the same bucket
+	// accessors work on it as on any other.
+	Summed Account
+	// Tail is the account's highest-id ledger entry. HasTail is false when the
+	// account has no ledger entries at all, in which case Tail is zero.
+	Tail    LedgerEntry
+	HasTail bool
+}
+
+// Reconciler is an optional interface: a storage layer implements it to check
+// accounts against their ledger entries using its own aggregation.
+//
+// # Why this is not just an optimization
+//
+// Checking conservation row-wise means streaming every ledger entry of every
+// account through the caller. At a billion entries that is both a billion rows
+// over the wire and, at a page size of a thousand, a million round trips: hours
+// of work holding a read transaction, to discover — in the normal case — that
+// nothing is wrong.
+//
+// A store with an aggregation engine can do the same comparison where the data
+// is and hand back only the accounts that fail it, which in the normal case is
+// no rows at all. The comparison is still the library's, via
+// AccountReconciliation.
+//
+// Implementing it is optional and mutually exclusive with the row-wise path: a
+// store that does not implement it is checked row-wise rather than not checked.
+type Reconciler interface {
+	// ReconcileAccounts reports up to limit accounts that may disagree with
+	// their ledger entries, in ascending account-key order, calling fn for
+	// each. It returns an error if fn does.
+	//
+	// It also returns how many accounts it examined, which is not the same as
+	// how many it reported: a healthy tenant reports no candidates out of
+	// however many accounts exist. The count is what lets the caller tell a
+	// check that found nothing wrong apart from a check that looked at nothing,
+	// and those two must not be reported the same way.
+	//
+	// An implementation must not decide that an account is *correct*: it
+	// reports candidates, and the library judges them.
+	ReconcileAccounts(
+		ctx context.Context,
+		tenantID int64,
+		limit int,
+		fn func(AccountReconciliation) error,
+	) (examined int, err error)
+}

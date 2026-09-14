@@ -6,7 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/im10furry/distledger"
+	"github.com/darkinno-tech/distledger"
+	"github.com/darkinno-tech/distledger/store/memory"
 )
 
 func (f *fixture) selfCheck() distledger.Report {
@@ -268,4 +269,195 @@ func TestMoneyStringRoundTripInReport(t *testing.T) {
 	if strconv.FormatInt(int64(m), 10) != "19999" {
 		t.Fatalf("minor units = %d, want 19999", int64(m))
 	}
+}
+
+// reconcilingStore wraps the in-memory store and adds the optional Reconciler
+// capability, so that the wiring between SelfCheck and a reconciling store can be
+// tested without a database.
+type reconcilingStore struct {
+	distledger.Store
+	calls    int
+	examined int
+	// candidates are reported to the caller as if the store had evaluated them.
+	candidates []distledger.AccountReconciliation
+}
+
+func (s *reconcilingStore) ReconcileAccounts(
+	ctx context.Context,
+	tenantID int64,
+	limit int,
+	fn func(distledger.AccountReconciliation) error,
+) (int, error) {
+	s.calls++
+	for _, m := range s.candidates {
+		if err := fn(m); err != nil {
+			return 0, err
+		}
+	}
+	return s.examined, nil
+}
+
+// newReconcilingFixture builds a fixture whose ledger talks to a store that can
+// reconcile, with the reconciling store's answers under the test's control.
+func newReconcilingFixture(
+	t *testing.T, rules distledger.Rules, rec *reconcilingStore,
+) *fixture {
+	t.Helper()
+	clock := distledger.NewManualClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	inner := memory.New()
+	rec.Store = inner
+	led, err := distledger.New(distledger.Config{
+		Store: rec,
+		Clock: clock,
+		Rules: rules,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = led.Close() })
+	// store stays the inner memory store: tests reach it directly to inject
+	// states the engine would never produce.
+	return &fixture{t: t, led: led, clock: clock, store: inner}
+}
+
+// TestSelfCheckDelegatesToAReconcilingStore pins the two things that make the
+// delegation worth having.
+//
+// The first is that the store is asked at all. A store that can aggregate in
+// place is the difference between a check whose cost tracks the number of ledger
+// entries and one whose cost tracks the number of broken accounts, so silently
+// falling back to the row-wise path would be a large and invisible regression.
+//
+// The second is that Checked reports the accounts examined rather than the
+// candidates reported. A healthy tenant reports no candidates, so counting
+// candidates would make "examined everything and found nothing wrong" look
+// identical to "examined nothing" - the one distinction Checked exists to draw.
+func TestSelfCheckDelegatesToAReconcilingStore(t *testing.T) {
+	ctx := context.Background()
+	rec := &reconcilingStore{examined: 7}
+	f := newReconcilingFixture(t, twoLevelRules(), rec)
+	f.healthy()
+
+	rep, err := f.led.SelfCheck(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.calls != 1 {
+		t.Fatalf("reconciler called %d times, want 1", rec.calls)
+	}
+	if !rep.Reconciled {
+		t.Fatal("Report.Reconciled is false although the store reconciled")
+	}
+	if !rep.OK {
+		t.Fatalf("healthy data reported problems: %+v", rep.Invariants)
+	}
+
+	i1, ok := invariantNamed(rep, "I1")
+	if !ok {
+		t.Fatalf("no I1 result in %+v", rep.Invariants)
+	}
+	if i1.Checked != 7 {
+		t.Fatalf("I1 Checked = %d, want 7: the accounts examined, not the 0 candidates reported",
+			i1.Checked)
+	}
+	if !i1.OK {
+		t.Fatalf("I1 failed on healthy data: %+v", i1)
+	}
+}
+
+// TestSelfCheckJudgesReconcilerCandidates checks that a candidate is still judged
+// by the library rather than taken as a verdict.
+//
+// A reconciling store reports accounts it could not confirm; it does not get to
+// decide they are wrong. If SelfCheck trusted the candidate list, then any store
+// that over-reported - through a conservative filter, or a bug - would turn into
+// false alarms, and the invariant would mean different things depending on which
+// storage layer was underneath.
+func TestSelfCheckJudgesReconcilerCandidates(t *testing.T) {
+	ctx := context.Background()
+	rec := &reconcilingStore{examined: 1}
+	f := newReconcilingFixture(t, twoLevelRules(), rec)
+	f.healthy()
+
+	key := distledger.UserKey{TenantID: tenant, UserID: 3001}
+	acct := readAccount(t, ctx, f.store, key)
+
+	var summed distledger.Account
+	for _, b := range distledger.AllBuckets() {
+		b.Set(&summed, b.Value(acct))
+	}
+	rec.candidates = []distledger.AccountReconciliation{{
+		Key: key, Stored: acct, Summed: summed,
+		Tail: lastLedgerEntry(t, ctx, f.store, key), HasTail: true,
+	}}
+
+	// A candidate that is in fact perfectly consistent. Reporting it was allowed:
+	// the store may be over-inclusive, because a false candidate costs a
+	// comparison while a missed one costs an undetected loss.
+	rep, err := f.led.SelfCheck(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK {
+		t.Fatalf("a consistent account reported as a candidate was treated as a violation: %+v",
+			rep.Invariants)
+	}
+
+	// The same candidate with a genuinely broken account row: the judgement must
+	// go the other way.
+	broken := acct
+	broken.Available += 999
+	rec.candidates[0].Stored = broken
+
+	rep, err = f.led.SelfCheck(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.OK {
+		t.Fatal("a broken account passed because the store called it a candidate rather than a violation")
+	}
+}
+
+func invariantNamed(rep distledger.Report, prefix string) (distledger.InvariantResult, bool) {
+	for _, inv := range rep.Invariants {
+		if len(inv.Name) >= len(prefix) && inv.Name[:len(prefix)] == prefix {
+			return inv, true
+		}
+	}
+	return distledger.InvariantResult{}, false
+}
+
+func readAccount(t *testing.T, ctx context.Context, s distledger.Store, key distledger.UserKey) distledger.Account {
+	t.Helper()
+	var out distledger.Account
+	if err := s.View(ctx, func(ctx context.Context, r distledger.Reader) error {
+		var err error
+		out, err = r.Account(ctx, key)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func lastLedgerEntry(
+	t *testing.T, ctx context.Context, s distledger.Store, key distledger.UserKey,
+) distledger.LedgerEntry {
+	t.Helper()
+	var out distledger.LedgerEntry
+	if err := s.View(ctx, func(ctx context.Context, r distledger.Reader) error {
+		page, err := r.LedgerEntries(ctx, key, distledger.LedgerQuery{
+			Page: distledger.Page{Limit: distledger.MaxPageLimit},
+		})
+		if err != nil {
+			return err
+		}
+		if len(page) > 0 {
+			out = page[len(page)-1]
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return out
 }

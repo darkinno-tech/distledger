@@ -55,6 +55,14 @@ type Report struct {
 	// Counters are the commission counts per state, useful for spotting data
 	// that is stuck and no longer moving.
 	Counters map[string]int64
+	// Reconciled reports that I1 was checked by the store's own aggregation
+	// rather than row-wise.
+	//
+	// It is reported because the two paths cost wildly different amounts and
+	// only one of them scales, so "the check passed" means something different
+	// depending on which ran. An operator diagnosing a slow self-check needs to
+	// know whether the store is doing the work or the client is.
+	Reconciled bool
 }
 
 // SelfCheck runs a ledger self-check for one tenant.
@@ -78,6 +86,25 @@ func (l *Ledger) SelfCheck(ctx context.Context, tenantID int64) (Report, error) 
 		rep.SchemaIssues = sc.CheckSchema(ctx)
 	}
 
+	// I1 is checked before the shared read transaction is opened, because a
+	// reconciling store runs its own aggregation and therefore owns its own read.
+	// A store without that ability is checked row-wise inside the transaction
+	// below, so the invariant is always checked, only differently - never
+	// skipped, which would be far worse than checking it the slow way.
+	var (
+		i1     InvariantResult
+		haveI1 bool
+	)
+	if rec, ok := l.store.(Reconciler); ok {
+		var err error
+		i1, err = l.checkLedgerConservationReconciled(ctx, rec, tenantID)
+		if err != nil {
+			return Report{}, err
+		}
+		haveI1 = true
+		rep.Reconciled = true
+	}
+
 	err := l.store.View(ctx, func(ctx context.Context, r Reader) error {
 		rep.Invariants = nil
 
@@ -90,9 +117,11 @@ func (l *Ledger) SelfCheck(ctx context.Context, tenantID int64) (Report, error) 
 			rep.Counters[s.String()] = states[s]
 		}
 
-		i1, err := l.checkLedgerConservation(ctx, r, tenantID)
-		if err != nil {
-			return err
+		if !haveI1 {
+			i1, err = l.checkLedgerConservation(ctx, r, tenantID)
+			if err != nil {
+				return err
+			}
 		}
 		rep.Invariants = append(rep.Invariants, i1)
 
@@ -154,19 +183,15 @@ func (l *Ledger) checkLedgerConservation(ctx context.Context, r Reader, tenantID
 			afterUserID = acct.Key.UserID
 			res.Checked++
 
-			if !acct.Settleable() {
-				for _, b := range AllBuckets() {
-					if v := b.Value(acct); v < 0 {
-						res.add("account %s has a negative %s bucket: %s", acct.Key, b, v)
-					}
-				}
-			}
-
 			// Walk the shared bucket definition rather than naming the four
 			// fields. Hand-written enumeration is how a newly added money field
 			// ends up outside every invariant while the ledger still balances.
+			//
+			// The sum is accumulated into an Account rather than a map so that
+			// the judgement below reads a bucket the same way whichever path
+			// produced it.
 			buckets := AllBuckets()
-			sums := make(map[Bucket]Money, len(buckets))
+			var sums Account
 			var (
 				last    LedgerEntry
 				entries int
@@ -187,11 +212,11 @@ func (l *Ledger) checkLedgerConservation(ctx context.Context, r Reader, tenantID
 					last = e
 					entries++
 					for _, b := range buckets {
-						sum, err := sums[b].Add(b.Delta(e))
+						sum, err := b.Value(sums).Add(b.Delta(e))
 						if err != nil {
 							return res, err
 						}
-						sums[b] = sum
+						b.Set(&sums, sum)
 					}
 				}
 				if len(page) < MaxPageLimit {
@@ -199,33 +224,97 @@ func (l *Ledger) checkLedgerConservation(ctx context.Context, r Reader, tenantID
 				}
 			}
 
-			if entries == 0 {
-				// An account with no ledger entries must be all zeros:
-				// accounts can only come into being driven by ledger entries.
-				for _, b := range buckets {
-					if v := b.Value(acct); v != 0 {
-						res.add("account %s has %s=%s but no ledger entries", acct.Key, b, v)
-					}
-				}
-				continue
-			}
-
-			for _, b := range buckets {
-				if sums[b] != b.Value(acct) {
-					res.add("account %s mismatch on %s: ledger deltas sum to %s but the account holds %s",
-						acct.Key, b, sums[b], b.Value(acct))
-				}
-				if after := b.After(last); after != b.Value(acct) {
-					res.add("account %s tail mismatch on %s: last ledger entry #%d recorded %s but the account holds %s",
-						acct.Key, b, last.ID, after, b.Value(acct))
-				}
-			}
+			accountConservationViolations(&res, acct, sums, last, entries)
 		}
 		if len(accounts) < MaxPageLimit {
 			break
 		}
 	}
 	return res, nil
+}
+
+// accountConservationViolations records every way one account can violate I1.
+//
+// This is the single implementation of the judgement. Both the row-wise path and
+// the reconciled path call it, so the two cannot drift into disagreeing about
+// what counts as a violation, or about how one is described.
+//
+// sums holds the sum of the account's ledger deltas per bucket, tail is its
+// highest-id entry, and entries is how many entries it has. When entries is zero
+// there is no tail and sums are all zero, which is why the zero-entry case is
+// decided from the account alone.
+func accountConservationViolations(res *InvariantResult, acct Account, sums Account, tail LedgerEntry, entries int) {
+	buckets := AllBuckets()
+
+	if !acct.Settleable() {
+		for _, b := range buckets {
+			if v := b.Value(acct); v < 0 {
+				res.add("account %s has a negative %s bucket: %s", acct.Key, b, v)
+			}
+		}
+	}
+
+	if entries == 0 {
+		// An account with no ledger entries must be all zeros: accounts can
+		// only come into being driven by ledger entries.
+		for _, b := range buckets {
+			if v := b.Value(acct); v != 0 {
+				res.add("account %s has %s=%s but no ledger entries", acct.Key, b, v)
+			}
+		}
+		return
+	}
+
+	for _, b := range buckets {
+		if sum := b.Value(sums); sum != b.Value(acct) {
+			res.add("account %s mismatch on %s: ledger deltas sum to %s but the account holds %s",
+				acct.Key, b, sum, b.Value(acct))
+		}
+		if after := b.After(tail); after != b.Value(acct) {
+			res.add("account %s tail mismatch on %s: last ledger entry #%d recorded %s but the account holds %s",
+				acct.Key, b, tail.ID, after, b.Value(acct))
+		}
+	}
+}
+
+// checkLedgerConservationReconciled verifies invariant I1 using a store that can
+// aggregate in place.
+//
+// The judgement is the same function the row-wise path calls. What differs is
+// that the sums, the tail entry and the entry count arrive from the store instead
+// of being accumulated one page at a time, which is the whole point: the cost of
+// the check stops depending on how many ledger entries exist and starts
+// depending only on how many accounts are actually wrong.
+func (l *Ledger) checkLedgerConservationReconciled(
+	ctx context.Context, rec Reconciler, tenantID int64,
+) (InvariantResult, error) {
+	res := InvariantResult{Name: "I1: account balance equals sum of ledger deltas", OK: true}
+
+	examined, err := rec.ReconcileAccounts(ctx, tenantID, MaxPageLimit, func(m AccountReconciliation) error {
+		accountConservationViolations(&res, m.Stored, m.Summed, m.Tail, entriesFromTail(m))
+		return nil
+	})
+	if err != nil {
+		return res, err
+	}
+	// Checked counts the accounts examined, not the candidates reported. The
+	// difference matters: a healthy tenant reports no candidates, so counting
+	// candidates would make a clean check indistinguishable from a check that
+	// examined nothing.
+	res.Checked = examined
+	return res, nil
+}
+
+// entriesFromTail reports whether the reconciled account has any ledger entries.
+//
+// Only zero and non-zero are distinguished, because that is all the judgement
+// above needs: it decides the zero-entry case from the account alone rather than
+// from a count it would have to trust.
+func entriesFromTail(m AccountReconciliation) int {
+	if m.HasTail {
+		return 1
+	}
+	return 0
 }
 
 // allocKey is the grouping key of the allocation check.

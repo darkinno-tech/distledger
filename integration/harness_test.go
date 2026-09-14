@@ -37,13 +37,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/darkinno-tech/distledger"
+	"github.com/darkinno-tech/distledger/store/memory"
+	"github.com/darkinno-tech/distledger/store/mysql"
+	"github.com/darkinno-tech/distledger/store/postgres"
+	sqlstore "github.com/darkinno-tech/distledger/store/sql"
+	"github.com/darkinno-tech/distledger/store/sqlite"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/im10furry/distledger"
-	"github.com/im10furry/distledger/store/memory"
-	"github.com/im10furry/distledger/store/mysql"
-	"github.com/im10furry/distledger/store/postgres"
-	sqlstore "github.com/im10furry/distledger/store/sql"
-	"github.com/im10furry/distledger/store/sqlite"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
@@ -54,6 +54,11 @@ type backend struct {
 	// open returns a fresh, empty store. It is called once per subtest so that
 	// no test can observe another's rows, and so that a failure cannot cascade.
 	open func(t *testing.T) distledger.Store
+	// reconciles reports whether the store implements Reconciler, and therefore
+	// whether SelfCheck checks I1 in the database or row-wise. Tests assert it
+	// rather than inferring it, so that a store quietly losing the ability would
+	// be noticed instead of silently making the cheap path untested.
+	reconciles bool
 }
 
 // backends lists every implementation the contract is run against.
@@ -63,18 +68,18 @@ type backend struct {
 func backends(t *testing.T) []backend {
 	t.Helper()
 	out := []backend{
-		{name: "memory", open: func(t *testing.T) distledger.Store {
+		{name: "memory", reconciles: false, open: func(t *testing.T) distledger.Store {
 			s := memory.New()
 			t.Cleanup(func() { _ = s.Close() })
 			return s
 		}},
-		{name: "sqlite", open: func(t *testing.T) distledger.Store {
+		{name: "sqlite", reconciles: true, open: func(t *testing.T) distledger.Store {
 			return openSQLite(t)
 		}},
 	}
 
 	if dsn := os.Getenv("DISTLEDGER_TEST_MYSQL_DSN"); dsn != "" {
-		out = append(out, backend{name: "mysql", open: func(t *testing.T) distledger.Store {
+		out = append(out, backend{name: "mysql", reconciles: true, open: func(t *testing.T) distledger.Store {
 			return openSQL(t, "mysql", dsn, mysql.Dialect{})
 		}})
 	} else {
@@ -82,7 +87,7 @@ func backends(t *testing.T) []backend {
 	}
 
 	if dsn := os.Getenv("DISTLEDGER_TEST_POSTGRES_DSN"); dsn != "" {
-		out = append(out, backend{name: "postgres", open: func(t *testing.T) distledger.Store {
+		out = append(out, backend{name: "postgres", reconciles: true, open: func(t *testing.T) distledger.Store {
 			return openSQL(t, "pgx", dsn, postgres.Dialect{})
 		}})
 	} else {
