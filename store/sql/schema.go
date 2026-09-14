@@ -1,7 +1,6 @@
 package sqlstore
 
 import (
-	"fmt"
 	"strings"
 )
 
@@ -181,12 +180,24 @@ var schemaTables = []TableDef{
 			{"tenant_id", "id"},                  // CommissionsByTenant keyset
 			{"tenant_id", "order_id"},            // CommissionsByOrder
 			{"tenant_id", "agent_user_id", "id"}, // CommissionsByAgent keyset
-			// DueCommissions and TenantsWithDueWork scan this across every
-			// tenant, so state and time lead and the tenant trails. A
-			// tenant-first index would make the heartbeat scan the whole backlog
-			// of whichever tenant sorts first, which is how a noisy neighbour
-			// stalls everyone else's settlement.
-			{"state", "available_at", "tenant_id"},
+			// The heartbeat needs two different access shapes, and one index
+			// cannot serve both without one of them degrading to a scan.
+			//
+			// DueCommissions filters a single tenant and ranges over time, so
+			// tenant_id and state lead and the time ordering follows. Measured as
+			// a covering range scan with no sort node.
+			{"state", "tenant_id", "available_at", "id"},
+			// TenantsWithDueWork cannot use the above: it wants a bounded window
+			// of the EARLIEST due rows and has no tenant to filter on. That needs
+			// time directly after the equality column.
+			//
+			// This index matters more than it looks. state = pending includes
+			// every order that has been paid but not yet received - a NULL
+			// available_at - and those vastly outnumber the ones that are
+			// actually due. Scanning them to find the due ones made the
+			// heartbeat's cost grow with the unreceived backlog rather than with
+			// the work.
+			{"state", "available_at", "id"},
 		},
 	},
 	{
@@ -241,11 +252,11 @@ func Statements(d Dialect) []string {
 	out := make([]string, 0, len(schemaTables)*4)
 	for _, t := range schemaTables {
 		out = append(out, createTable(d, t))
-		for i, cols := range t.Uniques {
-			out = append(out, d.IndexDDL(t.Name, indexName(t.Name, "uniq", i), cols, kindsOf(t), true))
+		for _, cols := range t.Uniques {
+			out = append(out, d.IndexDDL(t.Name, indexName(t.Name, "uniq", cols), cols, kindsOf(t), true))
 		}
-		for i, cols := range t.Indexes {
-			out = append(out, d.IndexDDL(t.Name, indexName(t.Name, "idx", i), cols, kindsOf(t), false))
+		for _, cols := range t.Indexes {
+			out = append(out, d.IndexDDL(t.Name, indexName(t.Name, "idx", cols), cols, kindsOf(t), false))
 		}
 	}
 	return out
@@ -295,8 +306,48 @@ func autoIDOnlyTable(d Dialect, t TableDef) bool {
 	return d.AutoIDIsPrimary() && len(t.Primary) == 1 && t.Primary[0] == "id"
 }
 
-func indexName(table, kind string, i int) string {
-	return fmt.Sprintf("%s_%s_%d", table, kind, i)
+// indexName derives an index name from the columns it covers.
+//
+// # Why not a counter
+//
+// The obvious name is table_kind_position, and it is a trap. A name that encodes
+// where an index sits in the list changes meaning the moment the list changes: a
+// database migrated by an earlier version keeps the old column set under
+// dist_commission_idx_3, while a database created from the current list gets a
+// different column set under the same name. Two deployments, one schema version,
+// two meanings for one identifier. Nothing can diagnose that, because the name is
+// the only thing that claims to identify the index.
+//
+// Deriving the name from the columns makes it a function of the definition, so it
+// cannot drift. It also makes the name self-describing in EXPLAIN output, which
+// is where these names are actually read.
+//
+// The name is truncated only if it would exceed the identifier limit, which the
+// schema tests check for; a truncated name keeps the leading columns, which are
+// the ones that decide whether the index can be used at all.
+func indexName(table, kind string, cols []string) string {
+	var b strings.Builder
+	b.WriteString(table)
+	b.WriteByte('_')
+	b.WriteString(kind)
+	for _, c := range cols {
+		b.WriteByte('_')
+		b.WriteString(c)
+	}
+	return truncateIdentifier(b.String())
+}
+
+// maxIdentifierLen is the shortest identifier limit among the supported
+// backends, so a name that satisfies it satisfies all of them. MySQL's is 64;
+// PostgreSQL's is 63, which is the binding one.
+const maxIdentifierLen = 63
+
+// truncateIdentifier shortens a name that no backend would accept.
+func truncateIdentifier(name string) string {
+	if len(name) <= maxIdentifierLen {
+		return name
+	}
+	return name[:maxIdentifierLen]
 }
 
 func quoteList(d Dialect, cols []string) string {

@@ -661,34 +661,43 @@ func (t *tx) DueCommissions(ctx context.Context, tenantID int64, dueAt time.Time
 	return out, err
 }
 
-// TenantsWithDueWork answers the heartbeat's question in one indexed query.
+// DueWork returns the earliest due commissions across every tenant.
 //
-// It is the SQL equivalent of the in-memory index walk: a range scan over
-// (state, available_at, tenant_id) that stops as soon as it has seen limit
-// distinct tenants. Its cost is proportional to the tenants that have work, not
-// to the tenants that exist, and not to the tenants that do not.
-func (t *tx) TenantsWithDueWork(ctx context.Context, dueAt time.Time, limit int) ([]int64, error) {
+// The plan is a range scan over (state, available_at, id) that stops at limit
+// rows, so the cost is the batch size and not the backlog. The case that matters
+// most is the empty one: when nothing is due, the range is empty and the query is
+// a seek that returns immediately. Producing a distinct tenant list instead made
+// the planner consult the whole pending set - which includes every paid but
+// unreceived order - to answer the same question.
+func (t *tx) DueWork(ctx context.Context, dueAt time.Time, limit int) ([]distledger.Commission, error) {
 	if limit <= 0 {
 		limit = distledger.DefaultPageLimit
 	}
 	b := t.b()
-	query := "SELECT DISTINCT " + t.cols("tenant_id") + " FROM " + t.table("dist_commission") +
+	query := "SELECT " + t.commissionCols() + " FROM " + t.table("dist_commission") +
 		" WHERE " + t.cols("state") + " = " + b.add(int64(distledger.CommissionPending)) +
 		" AND " + t.cols("available_at") + " IS NOT NULL" +
 		" AND " + t.cols("available_at") + " <= " + b.add(instantOrNull(dueAt)) +
-		" ORDER BY " + t.cols("tenant_id") +
+		" ORDER BY " + t.cols("available_at") + ", " + t.cols("id") +
 		" LIMIT " + b.add(int64(limit))
 
-	out := make([]int64, 0, 8)
+	out := make([]distledger.Commission, 0, minIntSQL(limit, 64))
 	err := t.queryRows(ctx, query, b.vals, func(rows *sql.Rows) error {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		c, err := scanCommission(rows)
+		if err != nil {
 			return err
 		}
-		out = append(out, id)
+		out = append(out, c)
 		return nil
 	})
 	return out, err
+}
+
+func minIntSQL(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (t *tx) LedgerEntries(ctx context.Context, key distledger.UserKey, q distledger.LedgerQuery) ([]distledger.LedgerEntry, error) {

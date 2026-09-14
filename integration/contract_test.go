@@ -320,14 +320,15 @@ func TestKeysetPagination(t *testing.T) {
 	}
 }
 
-func TestDueCommissionsAndTenantsWithWork(t *testing.T) {
+func TestDueCommissionsAndDueWork(t *testing.T) {
 	for _, b := range backends(t) {
 		t.Run(b.name, func(t *testing.T) {
 			ctx := context.Background()
 			s := b.open(t)
 
-			// Two tenants with work at different times, one without.
-			mk := func(tenantID int64, orderID string, dueIn time.Duration, receive bool) {
+			// Interleaved tenants and deadlines, so an implementation that walks
+			// tenants in order rather than deadlines in order fails here.
+			mk := func(tenantID int64, orderID string, dueIn time.Duration, receive bool) distledger.Commission {
 				t.Helper()
 				var c distledger.Commission
 				if err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
@@ -344,49 +345,59 @@ func TestDueCommissionsAndTenantsWithWork(t *testing.T) {
 				}); err != nil {
 					t.Fatal(err)
 				}
-				if !receive {
-					return
+				if receive {
+					if err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
+						_, err := tx.SetCommissionAvailableAt(ctx, c.ID, epoch.Add(dueIn), c.Version)
+						return err
+					}); err != nil {
+						t.Fatal(err)
+					}
 				}
-				if err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
-					_, err := tx.SetCommissionAvailableAt(ctx, c.ID, epoch.Add(dueIn), c.Version)
-					return err
-				}); err != nil {
-					t.Fatal(err)
-				}
+				return c
 			}
-			mk(1, "A", -2*time.Hour, true)
-			mk(5, "B", -time.Hour, true)
-			mk(7, "C", 48*time.Hour, true) // not due yet
-			mk(9, "D", 0, false)           // never received
 
-			tenants := read(t, ctx, s, func(ctx context.Context, r distledger.Reader) ([]int64, error) {
-				return r.TenantsWithDueWork(ctx, epoch, 100)
+			oldest := mk(9, "D", -5*time.Hour, true)
+			middle := mk(2, "B", -3*time.Hour, true)
+			newest := mk(7, "A", -time.Hour, true)
+			mk(3, "FUTURE", 48*time.Hour, true) // not due
+			mk(5, "NEVER", 0, false)            // no settlement date
+
+			batch := read(t, ctx, s, func(ctx context.Context, r distledger.Reader) ([]distledger.Commission, error) {
+				return r.DueWork(ctx, epoch, 10)
 			})
-			if !slices.Equal(tenants, []int64{1, 5}) {
-				t.Fatalf("TenantsWithDueWork = %v, want [1 5]", tenants)
+			want := []int64{oldest.ID, middle.ID, newest.ID}
+			got := make([]int64, 0, len(batch))
+			for _, c := range batch {
+				got = append(got, c.ID)
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("DueWork = %v, want %v (earliest deadline first)", got, want)
 			}
 
-			// The limit must bound the answer.
-			limited := read(t, ctx, s, func(ctx context.Context, r distledger.Reader) ([]int64, error) {
-				return r.TenantsWithDueWork(ctx, epoch, 1)
+			// The limit must keep the soonest, not an arbitrary subset: this is
+			// what makes the read bounded without changing what it means.
+			limited := read(t, ctx, s, func(ctx context.Context, r distledger.Reader) ([]distledger.Commission, error) {
+				return r.DueWork(ctx, epoch, 2)
 			})
-			if !slices.Equal(limited, []int64{1}) {
-				t.Fatalf("limited = %v, want [1]", limited)
+			if len(limited) != 2 || limited[0].ID != oldest.ID || limited[1].ID != middle.ID {
+				t.Fatalf("limited = %+v, want the two earliest", limited)
 			}
 
-			due := read(t, ctx, s, func(ctx context.Context, r distledger.Reader) ([]distledger.Commission, error) {
-				return r.DueCommissions(ctx, 1, epoch, 10)
-			})
-			if len(due) != 1 || due[0].Key.OrderID != "A" {
-				t.Fatalf("DueCommissions = %+v, want just order A", due)
-			}
-
-			// Nothing due anywhere is the common case for the heartbeat.
-			none := read(t, ctx, s, func(ctx context.Context, r distledger.Reader) ([]int64, error) {
-				return r.TenantsWithDueWork(ctx, epoch.Add(-100*time.Hour), 100)
+			// The empty case is the one the heartbeat hits on almost every tick,
+			// and it has to be a seek rather than a scan.
+			none := read(t, ctx, s, func(ctx context.Context, r distledger.Reader) ([]distledger.Commission, error) {
+				return r.DueWork(ctx, epoch.Add(-100*time.Hour), 10)
 			})
 			if len(none) != 0 {
-				t.Fatalf("expected no work, got %v", none)
+				t.Fatalf("expected no work, got %d", len(none))
+			}
+
+			// The per-tenant query still exists, and must agree about what is due.
+			due := read(t, ctx, s, func(ctx context.Context, r distledger.Reader) ([]distledger.Commission, error) {
+				return r.DueCommissions(ctx, 9, epoch, 10)
+			})
+			if len(due) != 1 || due[0].ID != oldest.ID {
+				t.Fatalf("DueCommissions = %+v, want just order D", due)
 			}
 		})
 	}

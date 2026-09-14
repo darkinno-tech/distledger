@@ -160,6 +160,19 @@ const (
 	InsertIDReturning
 )
 
+// dueWorkWindow bounds how many due commission rows the heartbeat looks at when
+// deciding which tenants have work.
+//
+// It exists so that the per-minute cost has a ceiling that does not depend on the
+// backlog. A pending commission includes every order that has been paid but not
+// yet received, so the pending set is large by nature; reading a bounded prefix
+// of the earliest due rows keeps the discovery step flat as that set grows.
+//
+// It is deliberately larger than the settlement budget for one tick, so that a
+// single tenant with a long backlog does not monopolise the window with rows that
+// are about to be settled anyway.
+const dueWorkWindow = 20000
+
 // Classifier lets a caller supply database-specific error classification.
 //
 // It exists for drivers whose errors expose neither a numeric nor a string code,

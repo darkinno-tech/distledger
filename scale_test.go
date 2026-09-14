@@ -151,3 +151,88 @@ func TestMaintainCostScalesWithWorkNotWithTenants(t *testing.T) {
 		t.Errorf("%d reads for 3 tenants out of 200, want a handful", got)
 	}
 }
+
+// TestMaintainWorkBudgetIsACeilingNotAPerLoopLimit pins the total work one
+// Maintain call may do.
+//
+// The budget has to hold across both nested loops, and a counter per loop bounds
+// neither their sum nor their product. The shape that exposes it is many tenants
+// with a deep backlog each: every tenant stays under the per-loop limit while the
+// call as a whole does far more than the budget allows. A per-minute cron job
+// that can be made to do an unbounded amount of work by a backlog is a job that
+// eventually runs past its own interval.
+//
+// The assertion is that the budget is reached, not merely respected, so that a
+// budget silently capped at zero by some other bug cannot pass this test.
+func TestMaintainWorkBudgetIsACeilingNotAPerLoopLimit(t *testing.T) {
+	const (
+		tenants        = 30
+		perTenant      = 900 // 27 000 due in total, above the 20 000 budget
+		wantOverBudget = tenants * perTenant
+	)
+
+	if wantOverBudget <= 20000 {
+		t.Fatalf("test needs more than the budget to prove anything, has %d", wantOverBudget)
+	}
+
+	clock := distledger.NewManualClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	store := memory.New()
+	t.Cleanup(func() { _ = store.Close() })
+	led := newLedgerOn(t, store, clock, distledger.Rules{
+		Levels: 1, RateBP: []distledger.Rate{1000}, FreezeDays: 0,
+	})
+	defer led.Close()
+
+	ctx := context.Background()
+	for tn := int64(1); tn <= tenants; tn++ {
+		if _, err := led.BindAgent(ctx, distledger.BindAgentRequest{
+			TenantID: tn, UserID: 3001, Status: distledger.AgentActive,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := led.BindBuyer(ctx, distledger.BindBuyerRequest{
+			TenantID: tn, BuyerUserID: 4001, AgentUserID: 3001, Source: distledger.SourceLink,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < perTenant; i++ {
+			order := fmt.Sprintf("ORD-%d", i)
+			if _, err := led.OnOrderPaid(ctx, distledger.OrderPaidEvent{
+				TenantID: tn, OrderID: order, BuyerUserID: 4001,
+				PaidAmount: 10000, PaidAt: clock.Now(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := led.OnOrderReceived(ctx, distledger.OrderReceivedEvent{
+				TenantID: tn, OrderID: order, ReceivedAt: clock.Now(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	res, err := led.Maintain(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SettledCount > 20000 {
+		t.Fatalf("one Maintain call settled %d commissions; the budget is 20000", res.SettledCount)
+	}
+	if res.SettledCount != 20000 {
+		t.Fatalf("settled %d of %d due; with more work than the budget the call should "+
+			"spend the whole budget", res.SettledCount, wantOverBudget)
+	}
+
+	// The remainder must still be there for the next tick, not lost or left
+	// half-settled: the budget defers work, it does not drop it.
+	next, err := led.Maintain(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.SettledCount == 0 {
+		t.Fatal("the second tick settled nothing; the deferred backlog was lost")
+	}
+	if got := res.SettledCount + next.SettledCount; got > wantOverBudget {
+		t.Fatalf("two ticks settled %d commissions but only %d were due", got, wantOverBudget)
+	}
+}

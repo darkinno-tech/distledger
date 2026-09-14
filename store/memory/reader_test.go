@@ -766,8 +766,8 @@ func TestReaderMethodsHonourCancellation(t *testing.T) {
 			_, err := r.CountCommissionsByState(ctx, 1)
 			return err
 		},
-		"TenantsWithDueWork": func(ctx context.Context, r distledger.Reader) error {
-			_, err := r.TenantsWithDueWork(ctx, time.Now().Add(time.Hour), 10)
+		"DueWork": func(ctx context.Context, r distledger.Reader) error {
+			_, err := r.DueWork(ctx, time.Now().Add(time.Hour), 10)
 			return err
 		},
 	}
@@ -913,17 +913,19 @@ func TestMultipleDueAppendsInOneTransaction(t *testing.T) {
 	}
 }
 
-// TestTenantsWithDueWorkReadsTheIndex pins the contract on
-// Reader.TenantsWithDueWork, which replaced an earlier "list every tenant"
-// method. The earlier shape made Maintain open one transaction per tenant per
-// tick; this shape makes it proportional to the tenants that actually have work
-// (ADR-035).
-func TestTenantsWithDueWorkReadsTheIndex(t *testing.T) {
+// TestDueWorkReturnsTheEarliestAcrossTenants pins the port's contract: the
+// heartbeat asks for work, not for tenants, and the batch must be the work that
+// has been waiting longest.
+//
+// An earlier shape of this method returned the distinct tenants that had work.
+// It read as one bounded lookup and was not: producing a distinct list in tenant
+// order made the planner consult the whole pending set, and the pending set is
+// large by nature because it includes every paid but unreceived order.
+func TestDueWorkReturnsTheEarliestAcrossTenants(t *testing.T) {
 	s := newStore(t)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	// Three tenants get a settlement date; one commission never does.
-	withDue := func(tenantID int64, orderID string, dueIn time.Duration) {
+	withDue := func(tenantID int64, orderID string, dueIn time.Duration) distledger.Commission {
 		t.Helper()
 		c := seedCommissionIn(t, s, tenantID, orderID, 100, distledger.CommissionPending)
 		withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
@@ -934,48 +936,59 @@ func TestTenantsWithDueWorkReadsTheIndex(t *testing.T) {
 			_, err = tx.SetCommissionAvailableAt(ctx, c.ID, base.Add(dueIn), cur.Version)
 			return err
 		})
+		return c
 	}
-	withDue(1, "ORD-A", -2*time.Hour)                                     // due two hours ago
-	withDue(5, "ORD-B", -time.Hour)                                       // due one hour ago
-	withDue(9, "ORD-C", 48*time.Hour)                                     // not due yet
-	seedCommissionIn(t, s, 7, "ORD-D", 100, distledger.CommissionPending) // never received
+
+	// Interleaved tenants and due times, so a tenant-ordered walk would return
+	// them in the wrong order.
+	oldest := withDue(9, "ORD-D", -5*time.Hour)
+	middle := withDue(2, "ORD-B", -3*time.Hour)
+	newest := withDue(7, "ORD-A", -time.Hour)
+	withDue(3, "ORD-FUTURE", 48*time.Hour)                                    // not due
+	seedCommissionIn(t, s, 5, "ORD-NEVER", 100, distledger.CommissionPending) // no date
 
 	withRead(t, s, func(ctx context.Context, r distledger.Reader) error {
-		got, err := r.TenantsWithDueWork(ctx, base, 100)
+		got, err := r.DueWork(ctx, base, 10)
 		if err != nil {
 			return err
 		}
-		want := []int64{1, 5}
-		if !slices.Equal(got, want) {
-			t.Fatalf("TenantsWithDueWork = %v, want %v", got, want)
+		want := []int64{oldest.ID, middle.ID, newest.ID}
+		ids := make([]int64, 0, len(got))
+		for _, c := range got {
+			ids = append(ids, c.ID)
+			if c.State != distledger.CommissionPending {
+				t.Errorf("non-pending commission returned: %+v", c)
+			}
+		}
+		if !slices.Equal(ids, want) {
+			t.Fatalf("DueWork = %v, want %v (earliest first)", ids, want)
 		}
 
-		// The limit bounds the answer and the order stays ascending, so a caller
-		// can resume deterministically.
-		limited, err := r.TenantsWithDueWork(ctx, base, 1)
+		// The limit must keep the SOONEST entries, not an arbitrary subset.
+		limited, err := r.DueWork(ctx, base, 2)
 		if err != nil {
 			return err
 		}
-		if !slices.Equal(limited, []int64{1}) {
-			t.Fatalf("limited = %v, want [1]", limited)
+		if len(limited) != 2 || limited[0].ID != oldest.ID || limited[1].ID != middle.ID {
+			t.Fatalf("limited = %+v, want the two earliest", limited)
 		}
 
-		// Nothing due anywhere is the common case and must cost nothing.
-		none, err := r.TenantsWithDueWork(ctx, base.Add(-100*time.Hour), 100)
+		// Nothing due anywhere is the case the heartbeat hits on almost every
+		// tick, and it must cost nothing.
+		none, err := r.DueWork(ctx, base.Add(-100*time.Hour), 10)
 		if err != nil {
 			return err
 		}
 		if len(none) != 0 {
-			t.Fatalf("expected no tenants with work, got %v", none)
+			t.Fatalf("expected no work, got %d", len(none))
 		}
 		return nil
 	})
 }
 
-// TestTenantsWithDueWorkIgnoresStaleIndexEntries keeps the stale-entry rule
-// consistent with DueCommissions: an index entry that disagrees with the
-// commission it points at must not create work.
-func TestTenantsWithDueWorkIgnoresStaleIndexEntries(t *testing.T) {
+// TestDueWorkIgnoresStaleIndexEntries keeps the freshness rule consistent with
+// DueCommissions.
+func TestDueWorkIgnoresStaleIndexEntries(t *testing.T) {
 	s := newStore(t)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
@@ -985,8 +998,6 @@ func TestTenantsWithDueWorkIgnoresStaleIndexEntries(t *testing.T) {
 		return err
 	})
 
-	// Make the index entry stale without removing it, the way a crashed writer
-	// would leave it.
 	s.mu.Lock()
 	stale := s.d.commissions[c.ID]
 	stale.State = distledger.CommissionSettled
@@ -994,50 +1005,12 @@ func TestTenantsWithDueWorkIgnoresStaleIndexEntries(t *testing.T) {
 	s.mu.Unlock()
 
 	withRead(t, s, func(ctx context.Context, r distledger.Reader) error {
-		got, err := r.TenantsWithDueWork(ctx, base.Add(time.Hour), 100)
+		got, err := r.DueWork(ctx, base.Add(time.Hour), 10)
 		if err != nil {
 			return err
 		}
 		if len(got) != 0 {
-			t.Fatalf("a stale index entry produced work for %v", got)
-		}
-		return nil
-	})
-}
-
-// TestTenantsWithDueWorkSeesEveryTenantInABlock covers the binary search that
-// skips from one tenant's entries to the next. A bug there would silently hide
-// every tenant after the first, which is the kind of failure that looks like
-// "settlement stopped for some tenants" months later.
-func TestTenantsWithDueWorkSeesEveryTenantInABlock(t *testing.T) {
-	s := newStore(t)
-	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-
-	// Several commissions per tenant, some due and some not, so each tenant's
-	// block holds more than one entry and the skip has to be exact.
-	for _, tenantID := range []int64{1, 2, 3, 4, 5} {
-		for i, dueIn := range []time.Duration{-time.Hour, time.Hour, 48 * time.Hour} {
-			c := seedCommissionIn(t, s, tenantID,
-				fmt.Sprintf("ORD-%d-%d", tenantID, i), 100, distledger.CommissionPending)
-			withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
-				cur, err := tx.Commission(ctx, c.ID)
-				if err != nil {
-					return err
-				}
-				_, err = tx.SetCommissionAvailableAt(ctx, c.ID, base.Add(dueIn), cur.Version)
-				return err
-			})
-		}
-	}
-
-	withRead(t, s, func(ctx context.Context, r distledger.Reader) error {
-		got, err := r.TenantsWithDueWork(ctx, base, 100)
-		if err != nil {
-			return err
-		}
-		want := []int64{1, 2, 3, 4, 5}
-		if !slices.Equal(got, want) {
-			t.Fatalf("TenantsWithDueWork = %v, want %v", got, want)
+			t.Fatalf("a stale index entry produced work: %+v", got)
 		}
 		return nil
 	})

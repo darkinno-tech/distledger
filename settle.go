@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -20,8 +21,12 @@ import (
 const (
 	// maintainBatch is the number of commissions handled per transaction.
 	maintainBatch = 200
-	// maintainTenantBatch is how many tenants are discovered per round.
-	maintainTenantBatch = 500
+	// maintainWorkBatch is how many due commissions one discovery read returns.
+	//
+	// It bounds the heartbeat's read independently of the backlog, and it is
+	// deliberately larger than maintainBatch so that one round can keep several
+	// tenants busy rather than refetching after each one.
+	maintainWorkBatch = 2000
 	// maxMaintainRounds bounds how many rounds one Maintain call runs.
 	maxMaintainRounds = 100
 	// maxSettlePerMaintain is the work budget of a single Maintain call.
@@ -30,8 +35,46 @@ const (
 	// through over several ticks rather than holding the job past its timeout.
 	// The budget makes the upper bound on one call explicit and independent of
 	// how many tenants happen to have work.
+	//
+	// "Independent of how many tenants" is the part that needs enforcing rather
+	// than documenting. There are two nested loops with their own round limits,
+	// and a per-loop counter bounds neither the sum nor the product. The budget
+	// is therefore one object shared by both, so the ceiling holds no matter how
+	// the work is distributed.
 	maxSettlePerMaintain = 20000
 )
+
+// workBudget is the settlement allowance for one Maintain call, shared by every
+// loop that spends it.
+//
+// It is spent only after a transaction commits. A store may retry a transaction
+// by re-running its closure, and a budget decremented inside the closure would
+// be charged for work that was rolled back, so the counts are committed outside.
+type workBudget struct {
+	left int
+}
+
+// exhausted reports whether the allowance is used up.
+func (b *workBudget) exhausted() bool { return b.left <= 0 }
+
+// spend charges committed work against the allowance.
+func (b *workBudget) spend(n int) {
+	b.left -= n
+	if b.left < 0 {
+		b.left = 0
+	}
+}
+
+// permits is how many items the next read may ask for: never more than the
+// caller wanted, and never more than the allowance can pay for. Bounding the read
+// as well as the write is what keeps a nearly-exhausted budget from fetching a
+// full batch it is not allowed to process.
+func (b *workBudget) permits(want int) int {
+	if b.left < want {
+		return b.left
+	}
+	return want
+}
 
 // OnOrderReceived handles "the buyer confirmed receipt".
 //
@@ -137,24 +180,35 @@ func (l *Ledger) Maintain(ctx context.Context) (MaintainResult, error) {
 		// the same record once per round.
 		seenQuarantine = make(map[int64]struct{})
 	)
+	budget := &workBudget{left: maxSettlePerMaintain}
 	for round := 0; round < maxMaintainRounds; round++ {
-		if total.SettledCount >= maxSettlePerMaintain {
+		if budget.exhausted() {
 			break
 		}
 
-		tenants, err := l.tenantsWithDueWork(ctx, now)
+		batch, err := l.dueWork(ctx, now, maintainWorkBatch)
 		if err != nil {
 			return total, err
 		}
-		if len(tenants) == 0 {
-			// Nothing is due anywhere. This is the common case, and it now costs
-			// one index query rather than one transaction per tenant.
+		if len(batch) == 0 {
+			// Nothing is due anywhere. This is the common case, and it is a
+			// seek that finds nothing rather than a scan that proves there is
+			// nothing.
 			break
 		}
 
+		// One transaction per tenant, so a failure stays inside one tenant, but
+		// the read that found the work was a single bounded query.
 		progressed := false
-		for _, tenantID := range tenants {
-			part, err := l.maintainTenant(ctx, tenantID, now)
+		for _, group := range groupByTenant(batch) {
+			if budget.exhausted() {
+				// The allowance is gone. Stopping here rather than after the
+				// tenant is the difference between a bounded call and one that
+				// overshoots by a whole tenant's worth of work per round.
+				break
+			}
+			tenantID := group.tenantID
+			part, err := l.maintainTenant(ctx, tenantID, now, budget)
 			for _, id := range part.Quarantined {
 				if _, dup := seenQuarantine[id]; dup {
 					continue
@@ -200,19 +254,53 @@ func (l *Ledger) Maintain(ctx context.Context) (MaintainResult, error) {
 	return total, nil
 }
 
-func (l *Ledger) tenantsWithDueWork(ctx context.Context, now time.Time) ([]int64, error) {
-	var out []int64
+// dueWork fetches one bounded batch of work across every tenant.
+func (l *Ledger) dueWork(ctx context.Context, now time.Time, limit int) ([]Commission, error) {
+	var out []Commission
 	err := l.store.View(ctx, func(ctx context.Context, r Reader) error {
 		var err error
-		out, err = r.TenantsWithDueWork(ctx, now, maintainTenantBatch)
+		out, err = r.DueWork(ctx, now, limit)
 		return err
 	})
 	return out, err
 }
 
-func (l *Ledger) maintainTenant(ctx context.Context, tenantID int64, now time.Time) (MaintainResult, error) {
+// groupByTenant splits a batch into per-tenant work, preserving the order the
+// batch arrived in.
+//
+// The batch is ordered by due time, so grouping preserves that within a tenant,
+// and sorting the tenant ids keeps the sequence of transactions deterministic -
+// which matters when reading a log of what a tick did.
+func groupByTenant(batch []Commission) []tenantBatch {
+	byTenant := make(map[int64][]Commission, 8)
+	for _, c := range batch {
+		byTenant[c.Key.TenantID] = append(byTenant[c.Key.TenantID], c)
+	}
+	ids := make([]int64, 0, len(byTenant))
+	for id := range byTenant {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	out := make([]tenantBatch, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, tenantBatch{tenantID: id, commissions: byTenant[id]})
+	}
+	return out
+}
+
+// tenantBatch is one tenant's share of a work batch.
+type tenantBatch struct {
+	tenantID    int64
+	commissions []Commission
+}
+
+func (l *Ledger) maintainTenant(ctx context.Context, tenantID int64, now time.Time, budget *workBudget) (MaintainResult, error) {
 	var out MaintainResult
 	for round := 0; round < maxMaintainRounds; round++ {
+		if budget.exhausted() {
+			break
+		}
 		// Each batch is its own transaction: batches do not share a lock, and
 		// the impact of one failure stays bounded.
 		var (
@@ -227,7 +315,7 @@ func (l *Ledger) maintainTenant(ctx context.Context, tenantID int64, now time.Ti
 			roundAmount = 0
 			roundQuarantine = nil
 
-			due, err := tx.DueCommissions(ctx, tenantID, now, maintainBatch)
+			due, err := tx.DueCommissions(ctx, tenantID, now, budget.permits(maintainBatch))
 			if err != nil {
 				return err
 			}
@@ -264,6 +352,7 @@ func (l *Ledger) maintainTenant(ctx context.Context, tenantID int64, now time.Ti
 			return out, err
 		}
 
+		budget.spend(roundCount)
 		out.SettledCount += roundCount
 		if amount, err := out.SettledAmount.Add(roundAmount); err != nil {
 			return out, err

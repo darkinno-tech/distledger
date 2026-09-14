@@ -158,28 +158,37 @@ type Reader interface {
 	// CountCommissionsByState counts commissions by state.
 	CountCommissionsByState(ctx context.Context, tenantID int64) (map[CommissionState]int64, error)
 
-	// TenantsWithDueWork returns the tenants holding at least one pending
-	// commission whose settlement time has arrived, in ascending order, at most
-	// limit of them.
+	// DueWork returns pending commissions whose settlement time has arrived,
+	// across every tenant, earliest first, at most limit of them.
 	//
 	// # Why the port asks for work rather than for tenants
 	//
-	// An earlier version of this port exposed "list every tenant", and Maintain
-	// walked that list opening a transaction per tenant. At a thousand tenants
-	// that is a thousand transactions per tick whether or not any work exists; at
-	// tens of thousands it is the dominant cost of the heartbeat.
+	// Two earlier shapes of this method were wrong, and both were caught by
+	// measuring rather than reasoning.
 	//
-	// The library does not own tenants - they belong to the caller's domain model
-	// - so it has no business enumerating them. What it does own is the work, and
-	// that is what it should ask for.
+	// The first listed every tenant, and Maintain opened a transaction per tenant:
+	// at a thousand tenants that is a thousand transactions per tick whether or
+	// not any work exists. The library does not own tenants - they belong to the
+	// caller's domain model - so it has no business enumerating them.
+	//
+	// The second asked for the distinct tenants that have work, which reads as one
+	// bounded lookup and is not. Producing a distinct list in tenant order makes
+	// the planner consult the whole due set; on 80k rows it read all of them to
+	// return 40 tenants, and bounding the read with a window made it slower still,
+	// because the window then had to be sorted before being deduplicated.
 	//
 	// # Cost
 	//
-	// An implementation MUST answer this from an index, not by scanning
-	// commissions. The natural shape is an index ordered by (state, available_at,
-	// tenant_id), which makes this an index-only range scan whose cost is
-	// proportional to the tenants that actually have work.
-	TenantsWithDueWork(ctx context.Context, dueAt time.Time, limit int) ([]int64, error)
+	// An implementation MUST answer this with a range scan over an index ordered
+	// by (state, available_at, id), stopping at limit rows. That makes the cost
+	// proportional to the batch, not to the backlog, and - the part that matters
+	// most for a per-minute heartbeat - it makes the empty case a seek that finds
+	// nothing rather than a scan that proves there is nothing.
+	//
+	// The caller groups the batch by tenant itself and opens one transaction per
+	// tenant, which keeps settlement isolated per tenant without giving up the
+	// bounded read.
+	DueWork(ctx context.Context, dueAt time.Time, limit int) ([]Commission, error)
 }
 
 // Writer is the write port.

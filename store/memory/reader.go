@@ -243,49 +243,105 @@ func (r *reader) CountCommissionsByState(ctx context.Context, tenantID int64) (m
 	return out, nil
 }
 
-// TenantsWithDueWork reads the settlement index.
+// DueWork returns the earliest due commissions across every tenant.
 //
-// The index is sorted by (tenant, due time, id), so one tenant's entries are
-// contiguous and its earliest entry is its first. That means each candidate
-// tenant costs a bounded look rather than a scan: walk the index, and for each
-// tenant block decide from its head whether it has work, then jump to the next
-// tenant with a binary search.
-func (r *reader) TenantsWithDueWork(ctx context.Context, dueAt time.Time, limit int) ([]int64, error) {
+// The index is sorted by (tenant, due time, id), which is not the order this
+// needs, so it cannot simply take a prefix. It walks the index once and keeps the
+// deadlines that arrive soonest, which is a bounded selection rather than a sort
+// of everything: the heap never holds more than limit entries no matter how many
+// commissions are pending.
+//
+// The cost is therefore O(pending entries with a settlement date) for the walk,
+// with O(log limit) work per candidate. That is the wrong side of the trade for a
+// production-sized installation, which is why the SQL backends answer this from
+// an index instead - but it keeps the in-memory store, whose documented role is
+// tests and small deployments, free of a second ordering to maintain.
+func (r *reader) DueWork(ctx context.Context, dueAt time.Time, limit int) ([]distledger.Commission, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
 		limit = distledger.DefaultPageLimit
 	}
-	idx := r.d.pendingDue
-	out := make([]int64, 0, minInt(limit, len(idx)))
 
-	for i := 0; i < len(idx) && len(out) < limit; {
-		tenantID := idx[i].tenantID
-		blockEnd := i + sort.Search(len(idx)-i, func(j int) bool {
-			return idx[i+j].tenantID != tenantID
-		})
-
-		// Within the block the entries ascend by due time, so the first fresh
-		// entry that has arrived settles the question for this tenant.
-		for j := i; j < blockEnd; j++ {
-			if idx[j].at.After(dueAt) {
-				break
-			}
-			c, ok := r.d.commissions[idx[j].id]
-			if !ok {
-				continue
-			}
-			// Same freshness rule as DueCommissions: a stale index entry is
-			// skipped rather than trusted.
-			if c.State == distledger.CommissionPending && c.AvailableAt.Equal(idx[j].at) {
-				out = append(out, tenantID)
-				break
-			}
+	// A max-heap keyed by (due time, id) keeps the soonest `limit` candidates,
+	// with the worst of them on top so a better one can replace it in O(log n).
+	worst := func(a, b dueRef) bool {
+		if !a.at.Equal(b.at) {
+			return a.at.After(b.at)
 		}
-		i = blockEnd
+		return a.id > b.id
 	}
+	heap := make([]dueRef, 0, minInt(limit, len(r.d.pendingDue)))
+
+	for _, ref := range r.d.pendingDue {
+		if ref.at.After(dueAt) {
+			continue
+		}
+		c, ok := r.d.commissions[ref.id]
+		if !ok {
+			continue
+		}
+		// The same freshness rule as everywhere else: an index entry that
+		// disagrees with its commission is ignored rather than trusted.
+		if c.State != distledger.CommissionPending || !c.AvailableAt.Equal(ref.at) {
+			continue
+		}
+		if len(heap) < limit {
+			heap = append(heap, ref)
+			if len(heap) == limit {
+				heapifyWorstFirst(heap, worst)
+			}
+			continue
+		}
+		if worst(heap[0], ref) {
+			heap[0] = ref
+			siftDownWorstFirst(heap, worst)
+		}
+	}
+
+	out := make([]distledger.Commission, 0, len(heap))
+	for _, ref := range heap {
+		if c, ok := r.d.commissions[ref.id]; ok {
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].AvailableAt.Equal(out[j].AvailableAt) {
+			return out[i].AvailableAt.Before(out[j].AvailableAt)
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out, nil
+}
+
+// heapifyWorstFirst arranges refs so the least desirable entry is at the root.
+func heapifyWorstFirst(refs []dueRef, worse func(a, b dueRef) bool) {
+	for i := len(refs)/2 - 1; i >= 0; i-- {
+		siftDownWorstFirstFrom(refs, i, worse)
+	}
+}
+
+func siftDownWorstFirst(refs []dueRef, worse func(a, b dueRef) bool) {
+	siftDownWorstFirstFrom(refs, 0, worse)
+}
+
+func siftDownWorstFirstFrom(refs []dueRef, i int, worse func(a, b dueRef) bool) {
+	for {
+		l, rr := 2*i+1, 2*i+2
+		largest := i
+		if l < len(refs) && worse(refs[l], refs[largest]) {
+			largest = l
+		}
+		if rr < len(refs) && worse(refs[rr], refs[largest]) {
+			largest = rr
+		}
+		if largest == i {
+			return
+		}
+		refs[i], refs[largest] = refs[largest], refs[i]
+		i = largest
+	}
 }
 
 // collectLedger gathers ledger entries through a keyset-paginated id index.

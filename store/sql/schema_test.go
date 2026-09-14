@@ -92,28 +92,109 @@ func TestSchemaCoversEveryDomainField(t *testing.T) {
 	}
 }
 
-// TestDueWorkIndexLeadsWithStateAndTime pins the index shape that makes the
-// heartbeat cheap (ADR-035).
+// TestDueWorkIndexShape pins the index shape that makes the heartbeat cheap
+// (ADR-035, ADR-038).
 //
 // TenantsWithDueWork asks "which tenants have work" across the whole
-// installation, and DueCommissions asks the same question for one tenant. Both
-// are answered by a range scan over this index. Ordering it tenant-first instead
-// would make the cross-tenant query scan the entire backlog of whichever tenant
-// happens to sort first, so the column order is load-bearing and is asserted here.
+// installation, and DueCommissions asks the same question for one tenant. The
+// column order is load-bearing for the first of those: DISTINCT tenant_id in
+// tenant order needs tenant_id directly after the equality column, or the planner
+// collects the whole due range and groups it. It was measured reading 80k rows to
+// find 40 tenants in that arrangement, so the order is asserted here rather than
+// left to whoever edits the schema next.
+// TestIndexNamesDescribeTheirColumns pins the property that makes index names
+// safe to rely on: a name is a function of the columns it covers.
+//
+// A positional name (table_idx_3) fails this. Insert a new index ahead of an
+// existing one and a database created from the new list gives that name a
+// different column set than a database migrated from the old list, so one
+// identifier ends up meaning two things across deployments while claiming to mean
+// one. The test asserts the derivation directly, and then asserts the property
+// that matters: reordering the list does not rename anything.
+func TestIndexNamesDescribeTheirColumns(t *testing.T) {
+	seen := map[string]string{}
+
+	for _, table := range sqlstore.Schema() {
+		for _, group := range []struct {
+			kind string
+			cols [][]string
+		}{
+			{"uniq", table.Uniques},
+			{"idx", table.Indexes},
+		} {
+			for _, cols := range group.cols {
+				name := sqlstore.IndexNameForTest(table.Name, group.kind, cols)
+
+				want := table.Name + "_" + group.kind
+				for _, c := range cols {
+					want += "_" + c
+				}
+				if len(want) > sqlstore.MaxIdentifierLenForTest {
+					want = want[:sqlstore.MaxIdentifierLenForTest]
+				}
+				if name != want {
+					t.Fatalf("index on %s%v named %q, want %q", table.Name, cols, name, want)
+				}
+
+				// Two indexes on the same columns under the same kind would
+				// collide, and the schema would silently drop one.
+				key := table.Name + "." + name
+				if prev, dup := seen[key]; dup {
+					t.Fatalf("index name %q used by both %s and %s%v", name, prev, table.Name, cols)
+				}
+				seen[key] = table.Name
+
+				if len(name) > sqlstore.MaxIdentifierLenForTest {
+					t.Fatalf("index name %q is %d bytes; the shortest backend limit is %d",
+						name, len(name), sqlstore.MaxIdentifierLenForTest)
+				}
+			}
+		}
+	}
+}
+
+// TestIndexNamesSurviveReordering is the property a positional scheme breaks.
+func TestIndexNamesSurviveReordering(t *testing.T) {
+	// The name of one index must not change when others are added or removed
+	// around it, which is what makes it safe to name an index in a hint or read
+	// one out of EXPLAIN on two different deployments and get the same thing.
+	cols := []string{"state", "available_at", "id"}
+	alone := sqlstore.IndexNameForTest("dist_commission", "idx", cols)
+	if got := sqlstore.IndexNameForTest("dist_commission", "idx", cols); got != alone {
+		t.Fatalf("index name is not a function of its columns: %q then %q", alone, got)
+	}
+
+	// The name must also distinguish different column sets, including ones that
+	// share a prefix, or two indexes would collide.
+	others := [][]string{
+		{"state", "available_at"},
+		{"state", "available_at", "id", "tenant_id"},
+		{"state", "tenant_id", "available_at", "id"},
+	}
+	names := map[string][]string{alone: cols}
+	for _, o := range others {
+		n := sqlstore.IndexNameForTest("dist_commission", "idx", o)
+		if prev, dup := names[n]; dup {
+			t.Fatalf("columns %v and %v share the index name %q", prev, o, n)
+		}
+		names[n] = o
+	}
+}
+
 func TestDueWorkIndexLeadsWithStateAndTime(t *testing.T) {
 	for _, table := range sqlstore.Schema() {
 		if table.Name != "dist_commission" {
 			continue
 		}
 		for _, idx := range table.Indexes {
-			if len(idx) == 3 && idx[0] == "state" {
-				if idx[1] != "available_at" || idx[2] != "tenant_id" {
-					t.Fatalf("due-work index = %v, want [state available_at tenant_id]", idx)
+			if len(idx) == 4 && idx[0] == "state" && idx[1] == "tenant_id" {
+				if idx[2] != "available_at" || idx[3] != "id" {
+					t.Fatalf("due-work index = %v, want [state tenant_id available_at id]", idx)
 				}
 				return
 			}
 		}
-		t.Fatal("dist_commission has no (state, available_at, tenant_id) index; " +
+		t.Fatal("dist_commission has no (state, tenant_id, available_at, id) index; " +
 			"the heartbeat would fall back to scanning")
 	}
 	t.Fatal("dist_commission is missing from the schema")
