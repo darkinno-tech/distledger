@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The library has no dependencies and needs nothing installed, so the only thing this
+# workflow asks for is permission to read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The rule this job exists to enforce: the library must be testable with nothing
+  # installed. If a change makes a root test need a database, this job fails, and it fails
+  # in the place where "it works on my machine" cannot hide.
+  library:
+    name: library (Go ${{ matrix.go }}, no database)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.22 is what go.mod declares. stable catches a future Go breaking something,
+        # which for a library that promises zero dependencies is worth knowing early.
+        go: ["1.22", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: false
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # Rule: go.mod keeps an empty require block. Checked mechanically, because a
+      # dependency added in a moment of convenience is exactly the kind of thing review
+      # waves through and nobody notices for a year.
+      - name: no third-party dependencies
+        run: |
+          if grep -qE '^[[:space:]]*require' go.mod; then
+            echo "go.mod has a require block. The library must depend on nothing."
+            echo "--- go.mod ---"
+            cat go.mod
+            exit 1
+          fi
+          echo "go.mod has no require block."
+
+      # The separation between the two modules is what makes this job meaningful: it is why
+      # a root test cannot reach a database driver even by accident. Both halves are
+      # asserted, because either one alone would still let drivers leak in.
+      - name: drivers cannot leak into the library
+        run: |
+          if [ ! -f integration/go.mod ]; then
+            echo "integration/go.mod is missing, so nothing keeps drivers out of the library."
+            exit 1
+          fi
+          if [ "$(go list -m)" = "$(cd integration && go list -m)" ]; then
+            echo "integration/ is not a separate module."
+            exit 1
+          fi
+          # The root module's package list must not reach anything under integration/.
+          if go list ./... | grep -q '/integration'; then
+            echo "the root module reaches integration packages, which carry drivers:"
+            go list ./... | grep '/integration'
+            exit 1
+          fi
+          echo "root module: $(go list -m)"
+          echo "integration module: $(cd integration && go list -m)"
+
+      - name: tests, with no database available
+        # Deliberately unset. If a root test silently starts depending on a backend
+        # because a developer had one running locally, this is where it shows up.
+        env:
+          DISTLEDGER_TEST_MYSQL_DSN: ""
+          DISTLEDGER_TEST_POSTGRES_DSN: ""
+          DISTLEDGER_EXPLAIN: ""
+        run: go test -race -count=1 ./...
+
+      - name: the example runs
+        working-directory: examples/01-quickstart
+        run: go run .
+
+  # Runs the same assertions against all four backends. This is where a dialect mistake
+  # surfaces; the library job above cannot see one.
+  integration:
+    name: integration (memory, SQLite, MySQL, PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: distledger
+          MYSQL_DATABASE: distledger
+        ports:
+          - 13307:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pdistledger"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: distledger
+          POSTGRES_DB: distledger
+        ports:
+          - 15433:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d distledger"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          check-latest: false
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l integration)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        working-directory: integration
+        run: go vet ./...
+
+      - name: tests against every backend
+        working-directory: integration
+        env:
+          DISTLEDGER_TEST_MYSQL_DSN: "root:distledger@tcp(127.0.0.1:13307)/distledger?charset=utf8mb4&parseTime=false"
+          DISTLEDGER_TEST_POSTGRES_DSN: "postgres://postgres:distledger@127.0.0.1:15433/distledger?sslmode=disable"
+        # -count=1 because a cached pass across four backends would be a false signal, and
+        # the concurrency tests are the ones most worth actually running.
+        run: go test -race -count=1 ./...
