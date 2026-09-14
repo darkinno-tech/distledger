@@ -186,6 +186,10 @@ cherry-picked on its own, which for a money library is not a stylistic concern.
 
 ## Running things
 
+**Check your Go version before running the integration suite.** The library needs Go 1.22,
+but `integration/` needs **Go 1.25**, because its drivers declare it. With the wrong
+toolchain you get `go.mod requires go >= 1.25.0` from a command that looks unrelated.
+
 ```bash
 go test ./...                              # library tests, no database needed
 go vet ./... && gofmt -l .                 # must both be clean

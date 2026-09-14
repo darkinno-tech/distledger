@@ -133,9 +133,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Not 1.22: this module's drivers require 1.25, and the library's own 1.22 floor is
+      # covered by the library job above. Vetting it with the wrong toolchain fails with
+      # "go.mod requires go >= 1.25.0", which is exactly what happened the first time.
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.22"
+          go-version: "1.25"
           check-latest: false
 
       - name: gofmt

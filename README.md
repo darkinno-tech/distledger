@@ -117,6 +117,12 @@ drivers never reach this one: see [`integration/`](integration/README.md).
 
 The driver import stays in your module. This is why the library's `go.mod` has an empty `require` block — a hard rule, not a preference. It also shapes the internals: even duplicate-key detection reads a driver error **structurally** rather than importing the driver's error type.
 
+> **Two Go versions, for two different audiences.** The library needs **Go 1.22**, and that is
+> all you need to use it. The `integration/` module needs **Go 1.25**, because its database
+> drivers declare that — so check `go version` before running the database-backed suite.
+> `go list -m -f '{{.Path}} {{.GoVersion}}' all` inside `integration/` shows where the floor
+> comes from.
+
 ---
 
 ## Design invariants

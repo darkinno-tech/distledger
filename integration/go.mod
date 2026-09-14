@@ -8,6 +8,14 @@
 //	cd integration && go test ./...   # requires the containers below
 module github.com/darkinno-tech/distledger/integration
 
+// The go directive is higher than the library's 1.22, and that difference is real
+// rather than an oversight: modernc.org/sqlite and jackc/pgx/v5 both declare 1.25,
+// so this module cannot be built or vetted with an older toolchain.
+//
+// It does not raise what the library requires. Only contributors running the
+// database-backed suite need this version; importing the library needs 1.22.
+//
+//	go list -m -f '{{.Path}} {{.GoVersion}}' all | sort -k2 -V | tail -1
 go 1.25.0
 
 replace github.com/darkinno-tech/distledger => ../

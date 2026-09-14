@@ -107,6 +107,20 @@
   幂等、SQL 注入、无界工作、依赖面），以及什么**不是**（库不做合规判定、不鉴权、不加密存储）
 - **`CODE_OF_CONDUCT.md`**
 
+### Fixed（CI 首次运行暴露的问题）
+
+- **`integration/` 需要 Go 1.25，而这一点没有任何地方写明**：库声明 Go 1.22，
+  集成模块声明 Go 1.25，两者不一致但**都是对的**——`modernc.org/sqlite` 与
+  `jackc/pgx/v5` 自身就要求 1.25。此前靠 `setup-go@v5` 让 Go 静默下载新工具链才没暴露；
+  升到 v6（它固定 `GOTOOLCHAIN=local`）后 CI 立刻报
+  `go.mod requires go >= 1.25.0 (running go 1.22.12)`。
+  这个错误一个 Go 1.22 的贡献者一定会撞上，且报错命令看起来毫不相关。
+  已在 `integration/go.mod`、CI、两份 README 与两份 CONTRIBUTING 中写明：
+  **用这个库只需要 1.22，跑集成测试需要 1.25**
+- **CI 的两个警告**：`actions/checkout` 与 `actions/setup-go` 的 v4/v5 面向已弃用的
+  Node 20，升到 v6；库的 job 关闭模块缓存——**库没有 `go.sum`，因为它没有依赖**，
+  缓存没有键可用，这个警告会永远重复（集成模块有 `go.sum`，缓存保留）
+
 ### Fixed（文档与实际不符）
 
 - **中文 README 里的示例输出是编造的**：它显示的是翻译成中文的输出（`③ 归因成功=true`），
