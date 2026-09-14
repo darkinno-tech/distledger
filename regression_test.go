@@ -14,7 +14,7 @@ import (
 )
 
 // This file holds regression tests for defects found during an adversarial
-// review of v0.1. Each test names the behavior it pins down, because the value
+// review. Each test names the behavior it pins down, because the value
 // of these tests is entirely in preventing a recurrence.
 
 // TestItemCountIsBounded pins the work bound on accrual.
@@ -325,8 +325,8 @@ func f2Balance(t *testing.T, led *distledger.Ledger, userID int64) distledger.Ac
 	return bal
 }
 
-// TestSelfCheckDetectsTamperedTotals pins the check that was missing entirely in
-// v0.1: TotalEarned and TotalReversed live outside the four money buckets, so
+// TestSelfCheckDetectsTamperedTotals pins the check that was originally missing:
+// TotalEarned and TotalReversed live outside the four money buckets, so
 // invariant I1 never looked at them.
 func TestSelfCheckDetectsTamperedTotals(t *testing.T) {
 	f := newFixture(t, twoLevelRules())

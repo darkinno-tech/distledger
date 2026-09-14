@@ -145,7 +145,7 @@ func runRandomSequence(t *testing.T, seed int64) {
 
 	// Backstop assertion: each agent's frozen + available buckets must
 	// equal the portion of their total commissions that has not been reversed.
-	// v0.1 has no reversals, so the two must be exactly equal.
+	// With no reversals the two must be exactly equal.
 	for _, agentID := range agents {
 		commissions, err := f.led.CommissionsByAgent(context.Background(), tenant, agentID,
 			distledger.CommissionQuery{})

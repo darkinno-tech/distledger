@@ -70,7 +70,7 @@ func TestRiskControlRejectsOverLongReason(t *testing.T) {
 // TestRefundAfterPayoutGoesThroughTheDebtPolicy replaces a test that pinned the
 // opposite behavior.
 //
-// Until v0.2.0 a refund against an already-paid-out commission was *skipped*:
+// Earlier, a refund against an already-paid-out commission was *skipped*:
 // the commission carried a "withdrawn" state, and the clawback returned a skip
 // reason and moved no money. That looks harmless and is not - the refund really
 // happened, and skipping it drops the platform's claim on the money without
@@ -215,7 +215,8 @@ func TestVoidOnAlreadyReversedCommissionIsANoOp(t *testing.T) {
 	}
 }
 
-// TestClawbackFailsLoudlyWhenTheBucketIsShort pins the safety net for v0.5.
+// TestClawbackFailsLoudlyWhenTheBucketIsShort pins the safety net for the case
+// withdrawals create: money that has left the account.
 //
 // With no withdrawals yet, the money for a settled commission is always still in
 // the bucket, so this path is unreachable through the public API. It exists for

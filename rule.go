@@ -231,8 +231,7 @@ func (r Rules) Describe() string {
 //
 // A self-incrementing version number plus a version table is deliberately
 // avoided here: that would need extra persistence and operational process,
-// while a content fingerprint already delivers the same explainability in
-// v0.1.
+// while a content fingerprint already delivers the same explainability.
 func (r Rules) Version() int64 {
 	sum := sha256.Sum256([]byte(r.Describe()))
 	// Shifting right by one guarantees a non-negative result, which makes it

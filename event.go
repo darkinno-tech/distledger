@@ -201,7 +201,7 @@ const (
 	// already zero.
 	SkipFullyReversed
 	// retiredSkipAlreadyWithdrawn (5) had no producer after the withdrawn
-	// commission state was removed, so it was dropped in v0.2.0. The numbering
+	// commission state was removed, so it was dropped. The numbering
 	// of the codes is not stored anywhere, so this gap is harmless - unlike the
 	// commission state values, which are persisted.
 	//

@@ -490,8 +490,8 @@ func (l *Ledger) debitBucket(
 	// is far harder to clean up than one failed clawback. RequireNonNegative
 	// makes that a guard on the statement itself.
 	//
-	// Until v0.5 this path was unreachable, because with no withdrawals the
-	// money was always still in the bucket. Withdrawals make it reachable: a
+	// Until withdrawals existed this path was unreachable, because the money
+	// was always still in the bucket. Withdrawals make it reachable: a
 	// settled commission can now be paid out before its order is refunded.
 	//
 	// # The debt policy

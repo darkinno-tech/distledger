@@ -74,7 +74,7 @@ func (s AgentStatus) String() string {
 // Agent is one agent.
 //
 // The relation chain is expressed as a parent pointer plus a depth. A
-// materialized path was deliberately left out of v0.1: the depth is hard-capped
+// materialized path was deliberately left out: the depth is hard-capped
 // at 3, so walking upwards takes at most 3 steps and a path would add
 // complexity with no measurable payoff; it can be introduced when "query the
 // whole team" becomes a requirement (see ADR-006).
@@ -175,7 +175,7 @@ const (
 	// CommissionSettled means it is settled and counts towards the withdrawable
 	// balance.
 	CommissionSettled
-	// commissionRetired 2 was CommissionWithdrawn. It was removed in v0.2.0,
+	// commissionRetired 2 was CommissionWithdrawn. It has been removed,
 	// and the value is retired rather than reused: the state column stores this
 	// integer, so renumbering the states below it would make every existing
 	// database misread its own rows.

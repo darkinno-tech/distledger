@@ -53,7 +53,7 @@ type PayoutRequest struct {
 // PayoutResult is a channel's answer.
 //
 // A channel reports success or failure; it does not report "maybe". Channels
-// that settle asynchronously are out of scope for v0.5 and are documented as
+// that settle asynchronously are out of scope and are documented as
 // such, because representing a payout whose outcome is unknown needs a state
 // this library does not have yet — and inventing one without the reconciliation
 // to go with it would be worse than not supporting it.

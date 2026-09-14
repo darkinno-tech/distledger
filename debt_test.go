@@ -12,7 +12,7 @@ import (
 // cashOutFixture settles a commission and then withdraws the whole balance, so
 // that a refund has nothing left to claw back.
 //
-// This is the state v0.5 makes reachable for the first time. Before withdrawals,
+// This is the state withdrawals make reachable for the first time. Before them,
 // a refund always found the money still sitting in a bucket, and the
 // insufficient-balance path in the clawback was documented as a safety net that
 // nothing could reach. Now it is ordinary.

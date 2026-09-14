@@ -63,10 +63,11 @@ var (
 	// ErrInsufficientBalance reports that a funds bucket does not hold enough balance
 	// to complete a reversal.
 	//
-	// In v0.3 this path is unreachable: with no withdrawals, the money being reversed
-	// is necessarily still sitting in the bucket. It is a safety net reserved for
-	// v0.5 — once withdrawals exist, reclaiming money that has already been taken
-	// out needs a debt strategy rather than pushing the bucket negative.
+	// It fires when a reversal needs money the account no longer holds, which is
+	// what happens once a commission can be paid out before its order is refunded.
+	// Pushing the bucket negative would break I1, so the answer is the debt policy:
+	// either refuse and name the shortfall, or record the debt deliberately
+	// (ADR-042). Either way it is never silent.
 	ErrInsufficientBalance = errors.New("distledger: insufficient balance for reversal")
 
 	// ErrOverflow reports an amount arithmetic overflow. Seeing it means the input

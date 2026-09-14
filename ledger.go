@@ -246,7 +246,7 @@ func (l *Ledger) resolveDepth(ctx context.Context, r Reader, key UserKey, parent
 
 // BindBuyer creates the "buyer -> agent" attribution relationship.
 //
-// # Attribution rules (v0.1)
+// # Attribution rules
 //
 //   - First binding wins: as long as the existing binding is still effective
 //     at BoundAt, it is not overwritten.
