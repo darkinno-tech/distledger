@@ -48,8 +48,8 @@ Code of conduct: **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)**
 | `PayoutChannel` abstraction, with a manual channel and a mock one for tests | ✅ |
 | Debt policy for clawing back money that has already been paid out | ✅ |
 
-**Everything above except withdrawals is usable today**, including multi-instance production
-deployments on MySQL, PostgreSQL or SQLite. `v0.1.0` is the first tagged release.
+**Everything above is usable today**, including multi-instance production deployments on
+MySQL, PostgreSQL or SQLite. `v0.1.0` is the only release so far, and it contains all of it.
 
 **Not yet built:** nothing in the table above. What is genuinely absent is narrower and
 listed where it belongs: asynchronous payout channels whose outcome is unknown at the time

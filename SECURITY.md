@@ -55,7 +55,7 @@ The project is pre-1.0. Only the latest tagged release is supported:
 
 | Version | Supported |
 |---|---|
-| v0.1.x (latest tag) | ✅ |
+| v0.1.0 (the only release so far) | ✅ |
 | `main` | ✅ — fixes land here first |
 | Older tags | ❌ |
 
