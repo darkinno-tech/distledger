@@ -87,6 +87,11 @@ type data struct {
 	refundIdem     map[idemRef]int64
 	refundsByOrder map[distledger.OrderKey][]int64
 
+	withdrawals map[int64]distledger.Withdrawal
+	// withdrawalIDs is an append-only ascending index over withdrawals.
+	withdrawalIDs []int64
+	withdrawIdem  map[idemRef]int64
+
 	ledger         map[int64]distledger.LedgerEntry
 	ledgerIDs      []int64
 	ledgerByUser   map[distledger.UserKey][]int64
@@ -120,6 +125,8 @@ func newData() *data {
 		refunds:        make(map[int64]distledger.Refund),
 		refundIdem:     make(map[idemRef]int64),
 		refundsByOrder: make(map[distledger.OrderKey][]int64),
+		withdrawals:    make(map[int64]distledger.Withdrawal),
+		withdrawIdem:   make(map[idemRef]int64),
 		ledger:         make(map[int64]distledger.LedgerEntry),
 		ledgerByUser:   make(map[distledger.UserKey][]int64),
 		ledgerByTenant: make(map[int64][]int64),
@@ -274,14 +281,16 @@ func (u *orderedUndo[T]) restore(cur []T) []T {
 
 // undo records the pre-transaction value of everything a transaction touches.
 type undo struct {
-	agents      map[distledger.UserKey]undoEntry[distledger.Agent]
-	bindings    map[distledger.UserKey]undoEntry[distledger.Binding]
-	accounts    map[distledger.UserKey]undoEntry[distledger.Account]
-	commissions map[int64]undoEntry[distledger.Commission]
-	ledger      map[int64]undoEntry[distledger.LedgerEntry]
-	idem        map[idemRef]undoEntry[int64]
-	refunds     map[int64]undoEntry[distledger.Refund]
-	refundIdem  map[idemRef]undoEntry[int64]
+	agents       map[distledger.UserKey]undoEntry[distledger.Agent]
+	bindings     map[distledger.UserKey]undoEntry[distledger.Binding]
+	accounts     map[distledger.UserKey]undoEntry[distledger.Account]
+	commissions  map[int64]undoEntry[distledger.Commission]
+	ledger       map[int64]undoEntry[distledger.LedgerEntry]
+	idem         map[idemRef]undoEntry[int64]
+	refunds      map[int64]undoEntry[distledger.Refund]
+	refundIdem   map[idemRef]undoEntry[int64]
+	withdrawals  map[int64]undoEntry[distledger.Withdrawal]
+	withdrawIdem map[idemRef]undoEntry[int64]
 
 	// Append-only indexes: old length plus whether the key existed at all.
 	byOrder        map[distledger.OrderKey]appendIndex
@@ -289,9 +298,10 @@ type undo struct {
 	refundsByOrder map[distledger.OrderKey]appendIndex
 	ledgerByUser   map[distledger.UserKey]appendIndex
 	ledgerByTenant map[int64]appendIndex
-	// The two global id slices always exist, so they only need a length.
+	// The global id slices always exist, so they only need a length.
 	ledgerIDsLen     int
 	commissionIDsLen int
+	withdrawalIDsLen int
 
 	// Ordered indexes: hybrid snapshots.
 	due        orderedUndo[dueRef]
@@ -310,6 +320,8 @@ func newUndo(d *data) *undo {
 		idem:             make(map[idemRef]undoEntry[int64]),
 		refunds:          make(map[int64]undoEntry[distledger.Refund]),
 		refundIdem:       make(map[idemRef]undoEntry[int64]),
+		withdrawals:      make(map[int64]undoEntry[distledger.Withdrawal]),
+		withdrawIdem:     make(map[idemRef]undoEntry[int64]),
 		byOrder:          make(map[distledger.OrderKey]appendIndex),
 		byAgent:          make(map[distledger.UserKey]appendIndex),
 		refundsByOrder:   make(map[distledger.OrderKey]appendIndex),
@@ -317,6 +329,7 @@ func newUndo(d *data) *undo {
 		ledgerByTenant:   make(map[int64]appendIndex),
 		ledgerIDsLen:     len(d.ledgerIDs),
 		commissionIDsLen: len(d.commissionIDs),
+		withdrawalIDsLen: len(d.withdrawalIDs),
 		nextID:           d.nextID,
 	}
 }
@@ -359,6 +372,22 @@ func saveLedger(u *undo, d *data, id int64) {
 	}
 	v, existed := d.ledger[id]
 	u.ledger[id] = undoEntry[distledger.LedgerEntry]{val: v, existed: existed}
+}
+
+func saveWithdrawal(u *undo, d *data, id int64) {
+	if _, ok := u.withdrawals[id]; ok {
+		return
+	}
+	v, existed := d.withdrawals[id]
+	u.withdrawals[id] = undoEntry[distledger.Withdrawal]{val: v, existed: existed}
+}
+
+func saveWithdrawIdem(u *undo, d *data, k idemRef) {
+	if _, ok := u.withdrawIdem[k]; ok {
+		return
+	}
+	v, existed := d.withdrawIdem[k]
+	u.withdrawIdem[k] = undoEntry[int64]{val: v, existed: existed}
 }
 
 func saveRefund(u *undo, d *data, id int64) {
@@ -420,6 +449,8 @@ func (u *undo) rollback(d *data) {
 	restoreMap(u.idem, d.idem)
 	restoreMap(u.refunds, d.refunds)
 	restoreMap(u.refundIdem, d.refundIdem)
+	restoreMap(u.withdrawals, d.withdrawals)
+	restoreMap(u.withdrawIdem, d.withdrawIdem)
 
 	restoreAppendIndex(u.byOrder, d.byOrder)
 	restoreAppendIndex(u.byAgent, d.byAgent)
@@ -428,6 +459,7 @@ func (u *undo) rollback(d *data) {
 	restoreAppendIndex(u.ledgerByTenant, d.ledgerByTenant)
 	d.ledgerIDs = d.ledgerIDs[:u.ledgerIDsLen]
 	d.commissionIDs = d.commissionIDs[:u.commissionIDsLen]
+	d.withdrawalIDs = d.withdrawalIDs[:u.withdrawalIDsLen]
 
 	d.pendingDue = u.due.restore(d.pendingDue)
 	d.accountIDs = u.accountIDs.restore(d.accountIDs)

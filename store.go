@@ -158,6 +158,25 @@ type Reader interface {
 	// CountCommissionsByState counts commissions by state.
 	CountCommissionsByState(ctx context.Context, tenantID int64) (map[CommissionState]int64, error)
 
+	// WithdrawalByIdemKey returns one withdrawal by the caller's idempotency
+	// key. It returns ErrNotFound when no such withdrawal exists.
+	//
+	// This is what makes a retried request safe: the caller's key is the only
+	// handle it has, so the lookup has to be by key rather than by the
+	// library's own id.
+	WithdrawalByIdemKey(ctx context.Context, tenantID int64, idemKey string) (Withdrawal, error)
+
+	// WithdrawalByID returns one withdrawal by its internal id.
+	WithdrawalByID(ctx context.Context, id int64) (Withdrawal, error)
+
+	// WithdrawalsByTenant returns a tenant's withdrawals, paginated, for
+	// reconciliation and for an operator reviewing a queue.
+	WithdrawalsByTenant(ctx context.Context, tenantID int64, p Page) ([]Withdrawal, error)
+
+	// CountWithdrawalsByState counts withdrawals by state, which tells a
+	// queue's shape at a glance.
+	CountWithdrawalsByState(ctx context.Context, tenantID int64) (map[WithdrawalState]int64, error)
+
 	// DueWork returns pending commissions whose settlement time has arrived,
 	// across every tenant, earliest first, at most limit of them.
 	//
@@ -272,6 +291,27 @@ type Writer interface {
 	// retryable concurrency conflict).
 	TransitionCommission(ctx context.Context, id int64, from, to CommissionState, expectedVersion int64) (Commission, error)
 
+	// AppendWithdrawal appends a withdrawal.
+	//
+	// An idempotency key conflict returns ErrDuplicate carrying the existing
+	// record, so that a retried request returns the original withdrawal rather
+	// than reserving the agent's money a second time.
+	AppendWithdrawal(ctx context.Context, w Withdrawal) (Withdrawal, error)
+
+	// TransitionWithdrawal advances a withdrawal's state and returns the
+	// persisted record.
+	//
+	// An illegal transition returns ErrIllegalTransition; a current state or
+	// version that does not match the expectation returns ErrConflict. The two
+	// stay distinct for the same reason as for commissions: one is a caller
+	// logic error and the other is a retryable race.
+	//
+	// The lifecycle timestamps travel in tr rather than being read from a clock
+	// inside the store, because processing time has exactly one source, the
+	// injected Clock (ADR-023). A store that read its own clock would produce a
+	// ledger whose timestamps depend on which backend was underneath.
+	TransitionWithdrawal(ctx context.Context, id int64, from, to WithdrawalState, expectedVersion int64, tr WithdrawalTransition) (Withdrawal, error)
+
 	// AppendRefund appends a refund voucher and returns the persisted record.
 	//
 	// An idempotency key conflict returns ErrDuplicate: that is precisely how
@@ -322,6 +362,29 @@ type Store interface {
 
 	// Close releases the underlying resources. Repeated calls must be safe.
 	Close() error
+}
+
+// WithdrawalTransition carries the lifecycle fields that change when a
+// withdrawal advances.
+//
+// It is a struct rather than a parameter list because the fields are not
+// independent of each other: which of them matter depends on the destination
+// state. A struct also lets a store write exactly what it was given, with no
+// clock of its own and no inference about which timestamp a state implies.
+type WithdrawalTransition struct {
+	// FailReason explains a payout that did not succeed.
+	FailReason string
+	// InvoiceNo is the payout provider's reference, set when a payout succeeds.
+	InvoiceNo string
+	// Operator records who approved or paid it.
+	Operator string
+	// AuditedAt is the processing time of an approval or rejection.
+	AuditedAt time.Time
+	// PaidAt is the processing time of a successful payout.
+	//
+	// A store must reject a transition to Paid without it: a paid withdrawal
+	// that does not say when is not auditable (ADR-018).
+	PaidAt time.Time
 }
 
 // SchemaChecker is an optional interface: a storage layer implements it to take

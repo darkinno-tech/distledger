@@ -55,6 +55,7 @@ const (
 	tableAccount    = "dist_account"
 	tableCommission = "dist_commission"
 	tableLedger     = "dist_ledger"
+	tableWithdraw   = "dist_withdraw"
 	tableRefund     = "dist_refund"
 )
 
@@ -65,6 +66,7 @@ const (
 	sizeItemID      = 128 // MaxOrderItemIDLen
 	sizeIdemKey     = 64  // MaxIdemKeyLen
 	sizeRemark      = 256 // MaxRemarkLen
+	sizeChannel     = 64  // payout channel name
 	sizeSourceRef   = 128
 	sizeReason      = 128
 	sizeShortString = 32
@@ -241,6 +243,35 @@ var schemaTables = []TableDef{
 		Primary: []string{"id"},
 		Uniques: [][]string{{"tenant_id", "idem_key"}},
 		Indexes: [][]string{{"tenant_id", "order_id"}},
+	},
+	{
+		Name: tableWithdraw,
+		Columns: []ColumnDef{
+			{Name: "id", Kind: KindInt64, NotNull: true},
+			{Name: "tenant_id", Kind: KindInt64, NotNull: true},
+			{Name: "user_id", Kind: KindInt64, NotNull: true},
+			{Name: "idem_key", Kind: KindString, Size: sizeIdemKey, NotNull: true},
+			{Name: "amount", Kind: KindInt64, NotNull: true},
+			{Name: "fee", Kind: KindInt64, NotNull: true, Default: "0"},
+			{Name: "real_amount", Kind: KindInt64, NotNull: true},
+			{Name: "channel", Kind: KindString, Size: sizeChannel, NotNull: true, Default: "''"},
+			{Name: "account_info", Kind: KindString, Size: sizeRemark, NotNull: true, Default: "''"},
+			{Name: "state", Kind: KindInt64, NotNull: true, Default: "0"},
+			{Name: "fail_reason", Kind: KindString, Size: sizeRemark, NotNull: true, Default: "''"},
+			{Name: "tax_amount", Kind: KindInt64, NotNull: true, Default: "0"},
+			{Name: "invoice_no", Kind: KindString, Size: sizeRemark, NotNull: true, Default: "''"},
+			{Name: "operator", Kind: KindString, Size: sizeRemark, NotNull: true, Default: "''"},
+			{Name: "applied_at", Kind: KindInstant},
+			{Name: "audited_at", Kind: KindInstant},
+			{Name: "paid_at", Kind: KindInstant},
+			{Name: "version", Kind: KindInt64, NotNull: true, Default: "1"},
+		},
+		Primary: []string{"id"},
+		Uniques: [][]string{{"tenant_id", "idem_key"}},
+		Indexes: [][]string{
+			{"tenant_id", "id"},          // WithdrawalsByTenant keyset
+			{"state", "tenant_id", "id"}, // queue by state
+		},
 	},
 }
 
