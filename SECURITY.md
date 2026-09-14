@@ -59,7 +59,7 @@ The project is pre-1.0. Only the latest tagged release is supported:
 | `main` | ✅ — fixes land here first |
 | Older tags | ❌ |
 
-Once v1.0 exists, this table will be replaced with a real support window.
+When the library commits to API stability, this table will be replaced with a real support window.
 
 ## What to include
 

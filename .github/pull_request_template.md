@@ -9,7 +9,7 @@ Closes #
 <!-- Tick what applies. If it touches an invariant or the store port, say more below. -->
 
 - [ ] Nothing in the public contract — internal only
-- [ ] An invariant (I1 / I2 / I3)
+- [ ] An invariant (I1 / I2 / I3 / I4)
 - [ ] The `Store` / `Reader` / `Writer` / `Tx` port
 - [ ] A dialect (`store/mysql`, `store/postgres`, `store/sqlite`)
 - [ ] Behaviour of one of the four entry points (`OnOrderPaid`, `OnOrderReceived`, `OnOrderRefunded`, `Maintain`)
