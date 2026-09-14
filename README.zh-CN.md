@@ -70,7 +70,7 @@
 
 ---
 
-## 快速开始（30 秒，不需要 MySQL）
+## 快速开始（30 秒，不需要数据库）
 
 ```bash
 git clone https://github.com/darkinno-tech/distledger.git
@@ -78,18 +78,19 @@ cd distledger/examples/01-quickstart
 go run .
 ```
 
-输出（节选）：
+输出（节选）。示例程序本身输出英文，下面是**实际输出**，不是翻译：
 
 ```
-③ 归因成功=true，产生 2 笔佣金
-   第 1 级  分销员=1002  基数=199.00  费率=5%  佣金=9.95
-   第 2 级  分销员=1001  基数=199.00  费率=2%  佣金=3.98
-   重复投递：重放=true，新增佣金=0 笔（幂等生效）
-④ 收货后 用户 1001：待结算=3.98 可提现=0.00 累计=3.98
-⑤ 推进 8 天后结算 2 笔，合计 13.93
-⑦ 自检：存储=memory 总体=true
-   [PASS] I1: account balance equals sum of ledger deltas（检查 2 项）
-   [PASS] I2: commission ledger linkage and allocation cap（检查 1 项）
+3) attributed=true, 2 commission(s) accrued
+   level 1  agent=1002  base=199.00  rate=5%  commission=9.95
+   level 2  agent=1001  base=199.00  rate=2%  commission=3.98
+   redelivered: replayed=true, new commissions=0 (idempotency holds)
+4) after receipt user 1001: frozen=3.98 available=0.00 total=3.98
+5) after 8 days: 2 settled, total 13.93
+7) self-check: store=memory overall=true
+   [PASS] I1: account balance equals sum of ledger deltas (2 checked)
+   [PASS] I2: commission ledger linkage and allocation cap (2 checked)
+   [PASS] I3: reversal accumulator, state and account totals reconcile (2 checked)
 ```
 
 最小可用代码：
@@ -268,9 +269,27 @@ func main() {
 
 ## 参与贡献
 
-非商业开源项目，不承诺响应时间。欢迎以下类型的贡献：
+完整指南：**[CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md)** ｜ English: **[CONTRIBUTING.md](CONTRIBUTING.md)**
 
-- ✅ 不变量测试、边界用例、文档修正、示例补充
-- ✅ 新的 `Store` 实现（PostgreSQL / SQLite / Redis）
-- ✅ 新的 `PayoutChannel` 实现（微信 / 支付宝 / 银行卡）
-- ❌ 向核心加入"玩法"（团队计酬 / 区域分红 / 链动）—— 这类能力只能作为第三方 `RateResolver` 实现存在
+开源维护，不承诺响应时间。**有两条规则由 CI 强制检查**，所以你会在提交时立刻知道，而不是等到 review：
+
+1. **仓库根目录的 `go test ./...` 必须在没有数据库的情况下通过。** 驱动包只出现在
+   `integration/`——一个独立模块，正是这层隔离让它们进不了这个库。
+2. **`go.mod` 的 `require` 块保持为空。** 没有例外：一棵你审计不了的依赖树，就是一本你审计不了的账。
+
+最欢迎：**不变量测试、边界用例，以及真实缺陷的回归测试**；其次是新的 `Store` 实现
+（它是对这套设计最好的压力测试，约 100 行 `Dialect`，不是再写一个 store），
+以及文档修正——尤其是文档声称了代码并没做的事。
+
+不在范围内：**往核心里加「玩法」**——团队计酬、区域分红、链动、按人头或按注册付费。
+这些只能作为第三方 `RateResolver` 存在。完整清单见 PRD §3.2，**那份清单是需求边界的法律**。
+
+| | |
+|---|---|
+| [Issue](https://github.com/darkinno-tech/distledger/issues/new/choose) | 缺陷报告与需求，走模板——模板问的是真正能定位问题的信息 |
+| [Discussions](https://github.com/darkinno-tech/distledger/discussions) | 「这个场景该怎么建模」与接入问题 |
+| [SECURITY.md](SECURITY.md) | 私密上报安全问题。这里什么算安全问题，范围窄而具体 |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | 对人客气一点 |
+| [docs/invariants.md](docs/invariants.md) | 每条不变量保证什么、**不覆盖什么** |
+| [docs/fault-reviews/](docs/fault-reviews/) | 故障复盘，包括每个缺陷**为什么此前没被发现** |
+

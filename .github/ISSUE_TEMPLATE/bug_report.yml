@@ -1,0 +1,130 @@
+name: Bug report
+description: Something behaved differently from what the documentation says, or money moved wrongly.
+title: "bug: "
+labels: ["bug", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Before you start, two things that change the answer a lot:
+
+        **Is this a wrong amount, or a wrong error?** If an amount is wrong, it is the highest
+        severity this project has and the numbers matter more than anything else in this form.
+
+        **Do not paste real money data.** Amounts and ids from a production ledger are
+        unnecessary — a synthetic example that reproduces the behaviour is better and safer.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before reporting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I removed real customer data, credentials and DSNs from everything below.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: distledger version
+      description: The tag or commit you are on, as it appears in your `go.mod`.
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      description: Output of `go version`.
+      placeholder: go1.22.5 darwin/arm64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Storage backend
+      description: >
+        Which store was in use. This matters more than usual here, because the SQL dialects
+        differ in transaction semantics and several bugs have been backend-specific.
+      options:
+        - store/memory
+        - store/sqlite
+        - store/mysql
+        - store/postgres
+        - A custom Store implementation
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of wrong is it?
+      options:
+        - An amount is wrong (money moved incorrectly)
+        - An error was returned where the docs say it should succeed
+        - No error was returned where the docs say one is required
+        - A state transition happened that should have been rejected
+        - Idempotency failed (a retry had an effect, or a genuine repeat was swallowed)
+        - A performance or resource problem
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: |
+        A minimal Go program is by far the most useful thing you can provide — ideally one
+        that runs against `store/memory`, since that needs nothing installed.
+
+        If the bug only appears on a SQL backend, say so and include which one and the schema
+        state. If it appears under concurrency, that is important: please mention roughly how
+        many concurrent callers and whether it is intermittent.
+      render: go
+    validations:
+      required: true
+
+  - type: textarea
+    id: selftest
+    attributes:
+      label: Self-check output
+      description: >
+        If the issue involves balances or the ledger, please include
+        `led.SelfCheck(ctx, tenantID)`. The invariants are the fastest way to tell a bug in the
+        library from a bug in the caller, and the `Reconciled` field says which check path ran.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Errors and logs
+      description: Full error text, including the wrapped detail. This library wraps errors with context deliberately — the detail is usually the answer.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: invariants
+    attributes:
+      label: Which invariant do you believe is affected?
+      description: Optional, but it speeds things up considerably.
+      options:
+        - label: I1 — an account balance disagrees with the sum of its ledger entries
+        - label: I2 — commission/ledger linkage, or an allocation exceeded its cap
+        - label: I3 — reversal accumulator, reversal chain, or account totals
+        - label: Not an invariant — this is about an error, an API, or performance

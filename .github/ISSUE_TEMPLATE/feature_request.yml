@@ -1,0 +1,88 @@
+name: Feature request
+description: Propose a capability. Please read the scope section first — a fair number of reasonable ideas belong outside the core.
+title: "feat: "
+labels: ["enhancement", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before writing: **the dividing line** this project is built on.
+
+        - If your idea changes **where** money flows, it belongs in the kernel, and this is the
+          right place to propose it.
+        - If it only changes **how much** is paid, it should be a third-party `RateResolver`,
+          and it needs no change here at all.
+
+        "How much" covers more than it sounds like: team commissions, regional dividends,
+        chain payouts, entry thresholds, per-head and per-signup payouts. Those are all
+        expressible outside the library, and putting them inside is what the scope list
+        exists to prevent.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before proposing
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I checked PRD §3.2 (Non-Goals) and my idea is not on that list.
+          required: true
+
+  - type: dropdown
+    id: side
+    attributes:
+      label: Which side of the dividing line is this on?
+      description: See the note above. An honest answer here saves everyone a round trip.
+      options:
+        - It changes where money flows — a kernel concern
+        - It only changes how much is paid — expressible as a RateResolver
+        - It is about storage, wiring or operations rather than money movement
+        - I am not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem you are trying to solve
+      description: >
+        Describe the situation, not the API. What is happening today, and what goes wrong
+        because of it? A concrete scenario is worth more than a proposed signature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: If you already know how you would like it to look, sketch it.
+      render: go
+    validations:
+      required: false
+
+  - type: textarea
+    id: why-core
+    attributes:
+      label: Why this cannot live outside the library
+      description: >
+        The default answer is "it can". If it can be done as a `RateResolver`, a custom `Store`
+        or a wrapper around the four entry points, please say how you tried and where it fell
+        short. "It would be more convenient here" is a real answer, but say so plainly.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contributions
+    attributes:
+      label: Would you be able to contribute it?
+      options:
+        - label: I can open a pull request for this
+        - label: I can help with tests or review
+        - label: I am reporting the need only, and cannot work on it

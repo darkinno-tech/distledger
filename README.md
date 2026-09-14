@@ -22,6 +22,9 @@ Every rule — how many levels, what rates, whether there is an entry bar — is
 All of them are in Chinese: they record design intent for the maintainer, and the trade-offs read
 better in the language they were argued in. The code, its comments and the commit history are English.
 
+Contributing: **[CONTRIBUTING.md](CONTRIBUTING.md)** ｜ Security: **[SECURITY.md](SECURITY.md)** ｜
+Code of conduct: **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)**
+
 > 中文说明见 **[README.zh-CN.md](README.zh-CN.md)**。
 
 ---
@@ -356,18 +359,38 @@ If you want to forbid commercial use, you need a non-OSI license such as PolyFor
 
 ## Contributing
 
-An open-source project maintained in the open, with no response-time guarantee. Welcome:
+Full guide: **[CONTRIBUTING.md](CONTRIBUTING.md)** ｜ 中文版：**[CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md)**
 
-- ✅ Invariant tests, boundary cases, documentation fixes, new examples
-- ✅ New `Store` implementations. The port is deliberately demanding, so a new backend is the best
-  pressure test the design gets — and it is about 100 lines of `Dialect`, not another store
-- ✅ New payout channel implementations (WeChat, Alipay, bank transfer), once withdrawals exist
-- ❌ Adding "game mechanics" to the core (team commissions, regional dividends, chain payouts) — those can
-  only exist as third-party `RateResolver` implementations
+An open-source project maintained in the open, with no guaranteed response time.
+**Two rules are enforced by CI**, so you will know immediately rather than in review:
 
-Two rules for a change to be mergeable:
+1. **`go test ./...` at the repository root must pass without a database.** Drivers live in
+   `integration/`, a separate module — that separation is what keeps them out of the library.
+2. **`go.mod` keeps an empty `require` block.** No exceptions: a ledger whose dependency tree
+   you cannot audit is a ledger you cannot audit.
 
-1. **`go test ./...` at the repository root must pass without a database.** If your change needs one,
-   the test belongs in `integration/`, which is a separate module for exactly this reason.
-2. **`go.mod` keeps an empty `require` block.** No exceptions: a distribution ledger that drags in a
-   dependency tree is a ledger you cannot audit.
+Most welcome: **invariant tests, boundary cases, and regression tests for real bugs** — plus new
+`Store` implementations, which are the best pressure test this design gets (about 100 lines of
+`Dialect`, not another store), and documentation corrections, especially where the docs claim
+something the code does not do.
+
+Out of scope: **"game mechanics" in the core** — team commissions, regional dividends, chain
+payouts, per-head or per-signup payouts. Those belong in a third-party `RateResolver`. The full
+list is PRD §3.2, and **that list is binding**.
+
+| | |
+|---|---|
+| [Issues](https://github.com/darkinno-tech/distledger/issues/new/choose) | Bug reports and feature requests, via templates that ask for what is actually diagnosable |
+| [Discussions](https://github.com/darkinno-tech/distledger/discussions) | "How do I model X" and integration questions |
+| [SECURITY.md](SECURITY.md) | Report a vulnerability privately. What counts here is narrow and specific |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Be decent to people |
+| [docs/fault-reviews/](docs/fault-reviews/) | Post-mortems, including why each bug was not caught earlier |
+
+## License
+
+[MIT](LICENSE) — free to use in commercial products.
+
+"Non-commercial" here describes **the maintainers' intent** (no commercial edition, no license
+sales, no open-core trimming). **It is not a restriction on users.**
+If you want to forbid commercial use, you need a non-OSI license such as PolyForm Noncommercial —
+at which point it is no longer open source.

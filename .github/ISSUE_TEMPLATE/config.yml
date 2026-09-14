@@ -1,0 +1,19 @@
+# Blank issues are disabled on purpose.
+#
+# Every issue here is either a wrong amount, a wrong error, or a scope question, and all
+# three need the same few facts to be answerable. An empty text box reliably produces
+# "it doesn't work" and a round trip, which is worse for the reporter than a form.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Question, or help integrating
+    url: https://github.com/darkinno-tech/distledger/discussions
+    about: For "how do I model X" and integration questions. Discussions is a better home for these than the issue tracker.
+
+  - name: Read the invariants first
+    url: https://github.com/darkinno-tech/distledger/blob/main/docs/invariants.md
+    about: What I1/I2/I3 each guarantee, and what they do not. Answers a good share of bug reports before they are filed.
+
+  - name: Security issue
+    url: https://github.com/darkinno-tech/distledger/security/policy
+    about: Please do not open a public issue for a vulnerability. See SECURITY.md.
