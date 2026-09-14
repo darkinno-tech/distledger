@@ -19,6 +19,7 @@
 package mysql
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 
@@ -96,6 +97,14 @@ func (Dialect) AutoIDIsPrimary() bool { return false }
 // LastInsertId, not through RETURNING.
 func (Dialect) InsertID() sqlstore.InsertIDStrategy { return sqlstore.InsertIDLastInsert }
 
+// InsertConflictClause implements sqlstore.Dialect.
+//
+// MySQL leaves the transaction usable after a duplicate-key error, so no clause
+// is needed. INSERT IGNORE would also work but is not used: it swallows every
+// error, including NOT NULL and truncation violations, which would turn a
+// genuine data error into a silently skipped row.
+func (Dialect) InsertConflictClause() string { return "" }
+
 // IsDuplicateKey implements sqlstore.Dialect.
 func (Dialect) IsDuplicateKey(err error) bool { return sqlstore.Detect.IsDuplicateKey(err) }
 
@@ -104,3 +113,12 @@ func (Dialect) IsRetryable(err error) bool { return sqlstore.Detect.IsRetryable(
 
 // IsAlreadyExists implements sqlstore.Dialect.
 func (Dialect) IsAlreadyExists(err error) bool { return sqlstore.Detect.IsAlreadyExists(err) }
+
+// Open wraps an already-open database handle with this dialect.
+//
+// It is a thin convenience over sqlstore.Open, and it exists so a caller does not
+// have to name the dialect type explicitly. The handle is still the caller's: the
+// library opens no connections and closes none.
+func Open(db *sql.DB, opts ...sqlstore.Option) (*sqlstore.Store, error) {
+	return sqlstore.Open(db, Dialect{}, opts...)
+}

@@ -23,9 +23,27 @@
 - 时刻以**整数纳秒**存储而非原生时间类型：原生时间戳的时区语义因库而异，一个会随服务器时区
   改变含义的账本不叫账本。缺省时刻存 NULL 而不是哨兵值
 
-### Planned
-- v0.4 续：SQL 内核的 26 个端口方法（事务、重试循环、乐观锁、幂等冲突）与 `Migrate`；
-  集成测试通过环境变量开关，未设置则跳过，因此依赖仍然为零
+### Added（v0.4 续：SQL store 主体与集成验证）
+
+- `store/sql` 的完整实现：26 个端口方法、事务与重试循环、`Migrate`、`Migrate` 幂等、`CheckSchema`
+- `store/mysql` / `store/postgres` / `store/sqlite` 各自的 `Open(db)`，库**不打开也不关闭**连接
+- **独立模块 `integration/`**：驱动只在这里出现，因此库本体的 `require` 依旧为空。
+  `go test ./...`（根目录）不需要数据库；集成测试用环境变量开关，未设置则跳过
+- 集成测试对**四个后端跑同一套断言**（68 个子测试），外加完整引擎生命周期、风控、自检、
+  事务重试契约与并发幂等
+
+### Fixed（由集成测试在真实数据库上发现）
+
+- **PostgreSQL 下「插入 → 捕获重复键错误」不可用**：PG 里一条语句失败会**中止整个事务**，
+  后续语句全部报错、`COMMIT` 变成回滚。新增 `Dialect.InsertConflictClause`，
+  PG 用 `ON CONFLICT DO NOTHING` 并从影响行数判断结果；MySQL/SQLite 保持错误分类
+- **`NOT NULL` 文本列被写入 NULL**：空串有语义的列（如 `order_item_id` 空串表示整单级分佣）
+  是 `NOT NULL`，三个后端在集成测试首轮就同时报错
+- **非法状态迁移未被拒绝**：SQL 实现只靠 `WHERE state = ?` 匹配，导致 `Pending -> Withdrawn`
+  被直接执行。改为匹配成功后校验合法性并让事务回滚，
+  从而与内存实现保持同样的「状态/版本不匹配优先报 Conflict」语义
+- **冲正上界的 SQL 守卫方向写反**：原为 `reversed_amount <= 新值`，恒真。
+  改为 `amount >= 新值`——上界取决于行自身的金额，只有拿**新值**与行内 `amount` 比较才在并发下正确
 - v0.5 提现链路与 `PayoutChannel`（含「已出账后追回」的欠款策略）
 - v0.6 可观测性钩子 + `examples` 补齐 02–05
 

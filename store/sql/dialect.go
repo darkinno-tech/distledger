@@ -125,6 +125,20 @@ type Dialect interface {
 	// InsertID reports how the dialect returns the id of a freshly inserted row.
 	InsertID() InsertIDStrategy
 
+	// InsertConflictClause returns the clause that turns a unique-constraint
+	// collision into a no-op insert, or "" when the dialect reports the collision
+	// as an error instead.
+	//
+	// This is not a stylistic difference. PostgreSQL aborts the ENTIRE
+	// transaction when any statement fails, so there the "insert and catch the
+	// duplicate error" pattern is unusable: the transaction is already poisoned
+	// and the eventual COMMIT turns into a rollback. The collision has to be
+	// absorbed by the statement itself. MySQL and SQLite leave the transaction
+	// usable after a constraint error, so they can raise and be classified.
+	//
+	// PostgreSQL: " ON CONFLICT DO NOTHING". MySQL and SQLite: "".
+	InsertConflictClause() string
+
 	// IsAlreadyExists reports whether err means the object being created is
 	// already there.
 	//

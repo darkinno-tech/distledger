@@ -16,6 +16,15 @@ import (
 // Column names match the domain structs, so a reader can move between model.go
 // and this file without a translation table.
 
+// # Nullability convention
+//
+// A text column is NOT NULL when the empty string carries meaning - an empty
+// order_item_id means "order-level accrual", an empty biz_id means "no business
+// reference" - and nullable only when the value is genuinely unknown. The write
+// path has to follow the same convention: sending NULL to a NOT NULL column is a
+// runtime error on every backend, and it was the first thing the integration
+// suite caught.
+//
 // ColumnDef describes one column of the portable schema.
 type ColumnDef struct {
 	Name string

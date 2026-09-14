@@ -18,6 +18,7 @@
 package postgres
 
 import (
+	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -95,6 +96,13 @@ func (Dialect) AutoIDIsPrimary() bool { return false }
 // store appends RETURNING.
 func (Dialect) InsertID() sqlstore.InsertIDStrategy { return sqlstore.InsertIDReturning }
 
+// InsertConflictClause implements sqlstore.Dialect.
+//
+// PostgreSQL needs it: a failed statement aborts the whole transaction, so a
+// duplicate key cannot be caught and carried on from. ON CONFLICT DO NOTHING
+// absorbs exactly the constraint collisions and lets every other error through.
+func (Dialect) InsertConflictClause() string { return " ON CONFLICT DO NOTHING" }
+
 // IsDuplicateKey implements sqlstore.Dialect.
 func (Dialect) IsDuplicateKey(err error) bool { return sqlstore.Detect.IsDuplicateKey(err) }
 
@@ -103,3 +111,12 @@ func (Dialect) IsRetryable(err error) bool { return sqlstore.Detect.IsRetryable(
 
 // IsAlreadyExists implements sqlstore.Dialect.
 func (Dialect) IsAlreadyExists(err error) bool { return sqlstore.Detect.IsAlreadyExists(err) }
+
+// Open wraps an already-open database handle with this dialect.
+//
+// It is a thin convenience over sqlstore.Open, and it exists so a caller does not
+// have to name the dialect type explicitly. The handle is still the caller's: the
+// library opens no connections and closes none.
+func Open(db *sql.DB, opts ...sqlstore.Option) (*sqlstore.Store, error) {
+	return sqlstore.Open(db, Dialect{}, opts...)
+}

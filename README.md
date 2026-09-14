@@ -31,7 +31,7 @@ Every rule — how many levels, what rates, whether there is an entry bar — is
 | Refund reversal (full order / per item / partial, accumulated in instalments) | ✅ v0.3 |
 | Risk control: freeze, unfreeze, void | ✅ v0.3 |
 | `SelfCheck` invariant I3 (reversal accumulator ↔ detail ↔ account reconciliation) | ✅ v0.3 |
-| **Pluggable SQL store: one core, MySQL / PostgreSQL / SQLite dialects** | ⏳ v0.4 |
+| **Pluggable SQL store: one core, MySQL / PostgreSQL / SQLite dialects** | ✅ v0.4 |
 | Withdrawals and payout channels (including the debt policy for clawing back money already paid out) | ⏳ v0.5 |
 
 **v0.1–v0.3 are usable today** for single-process deployments and test environments.
@@ -71,9 +71,9 @@ led, _ := distledger.New(distledger.Config{Store: memstore.New(), Rules: rules})
 | Backend | Import | Use it for |
 |---|---|---|
 | In-memory | `store/memory` | Tests, demos, single-process deployments. Zero external dependencies. |
-| MySQL | `store/mysql` | ⏳ v0.4 |
-| PostgreSQL | `store/postgres` | ⏳ v0.4 |
-| SQLite | `store/sqlite` | ⏳ v0.4, embedded deployments |
+| MySQL | `store/mysql` | Multi-instance production deployments |
+| PostgreSQL | `store/postgres` | Multi-instance production deployments |
+| SQLite | `store/sqlite` | Embedded and single-node deployments |
 | Portable core | `store/sql` (package `sqlstore`) | Shared by the SQL backends; not used directly |
 
 The SQL backends share **one** portable core that builds statements through a `Dialect`. Each dialect package only supplies what genuinely differs between databases: placeholders (`?` versus `$1`), identifier quoting, type names, the generated-key form, duplicate-key and retryable-error classification, and index DDL. **Adding a backend means writing a dialect of about 100 lines, not another store** — because several copies of the accounting rules would drift apart, and a fix applied to only one of them raises no error.
@@ -90,8 +90,14 @@ import (
 )
 
 db, _ := sql.Open("mysql", dsn)
-store, _ := sqlstore.Open(db, mysql.Dialect{})
+store, _ := mysql.Open(db)   // or sqlstore.Open(db, mysql.Dialect{})
+if err := store.Migrate(ctx); err != nil { ... }   // idempotent
 ```
+
+Every backend is held to the same contract by an integration suite that runs the
+same assertions against all four, including a full engine lifecycle and a
+reconciliation on a real database. That suite lives in its own module so the
+drivers never reach this one: see [`integration/`](integration/README.md).
 
 The driver import stays in your module. This is why the library's `go.mod` has an empty `require` block — a hard rule, not a preference. It also shapes the internals: even duplicate-key detection reads a driver error **structurally** rather than importing the driver's error type.
 

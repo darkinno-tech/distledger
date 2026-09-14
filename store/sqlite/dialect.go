@@ -23,6 +23,7 @@
 package sqlite
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 
@@ -98,6 +99,12 @@ func (Dialect) AutoIDIsPrimary() bool { return true }
 // InsertID implements sqlstore.Dialect.
 func (Dialect) InsertID() sqlstore.InsertIDStrategy { return sqlstore.InsertIDReturning }
 
+// InsertConflictClause implements sqlstore.Dialect.
+//
+// SQLite aborts the failing statement, not the transaction, so the error can be
+// classified and no clause is needed.
+func (Dialect) InsertConflictClause() string { return "" }
+
 // IsDuplicateKey implements sqlstore.Dialect.
 func (Dialect) IsDuplicateKey(err error) bool { return sqlstore.Detect.IsDuplicateKey(err) }
 
@@ -109,3 +116,12 @@ func (Dialect) IsRetryable(err error) bool { return sqlstore.Detect.IsRetryable(
 
 // IsAlreadyExists implements sqlstore.Dialect.
 func (Dialect) IsAlreadyExists(err error) bool { return sqlstore.Detect.IsAlreadyExists(err) }
+
+// Open wraps an already-open database handle with this dialect.
+//
+// It is a thin convenience over sqlstore.Open, and it exists so a caller does not
+// have to name the dialect type explicitly. The handle is still the caller's: the
+// library opens no connections and closes none.
+func Open(db *sql.DB, opts ...sqlstore.Option) (*sqlstore.Store, error) {
+	return sqlstore.Open(db, Dialect{}, opts...)
+}

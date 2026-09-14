@@ -1,0 +1,42 @@
+# Backends used by the integration tests.
+#
+# The library itself depends on no database driver, so these containers exist
+# only for the separate integration module next to this file, which brings its
+# own drivers. `go test ./...` at the repository root never needs them.
+#
+#   docker compose up -d --wait
+#   DISTLEDGER_TEST_MYSQL_DSN='...' DISTLEDGER_TEST_POSTGRES_DSN='...' go test ./...
+#
+# Ports are non-default so that an existing local database is not disturbed.
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: distledger
+      MYSQL_DATABASE: distledger
+    ports:
+      - "13307:3306"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # The store relies on real transactions and row locks; MyISAM would
+      # silently give neither.
+      - --default-storage-engine=InnoDB
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pdistledger"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: distledger
+      POSTGRES_DB: distledger
+    ports:
+      - "15433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d distledger"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
