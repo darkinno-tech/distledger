@@ -554,7 +554,7 @@ bal, _ := led.Balance(ctx, 0, 1001) // 佣金已从「待结算」进入「可�
 | **v0.1** ✅ 已交付 | 内存 store + 关系链 + 归因 + 多级分佣 + 幂等键 + 冻结快照 + `Maintain` 结算 + I1/I2 自检 | `examples/01` 可跑；`-race` 全绿；覆盖率 88.7%/93.5%/92.9% |
 | **v0.2** | 规则层扩展（等级费率、SKU 级覆盖）+ `examples/02` | 规则可插拔验证 |
 | **v0.3** | 退款冲正（全退/部分退/已结算追回）+ I3 | `examples/03` 可跑 |
-| **v0.4** | MySQL store + 事务/乐观锁 + `Migrate` | 生产可用 |
+| **v0.4** | 可移植 SQL 内核（`store/sql`）+ MySQL / PostgreSQL / SQLite 三个方言 + `Migrate` + `schema.sql` | 多实例生产可用；ADR-030 的重试契约首次被真实数据库执行 |
 | **v0.5** | 提现链路 + `PayoutChannel` + `ManualChannel` | `examples/04` 可跑 |
 | **v0.6** | `SelfCheck` + `Maintain` + 可观测性钩子 | 接入自诊可用 |
 | **v1.0** | API 冻结 + 文档完整 + property-based 全绿 | 三个不变量通过 10 万次随机序列 |
@@ -592,10 +592,17 @@ distledger/
 ├── selfcheck.go              # 不变量 I1 / I2 / I3 校验
 │
 ├── internal/safemath/        # 128 位乘除与溢出检测原语
-├── store/memory/             # 内存实现（事务回滚 / 键集分页 / 到期索引）
+│
+├── store/                    # 存储层：端口在根包，实现可替换
+│   ├── memory/               # 内存实现（事务回滚 / 键集分页 / 到期索引 / 租户登记）
+│   └── sql/                  # ⏳ v0.4 可移植 SQL 内核，通过 Dialect 拼装语句
+├── store/mysql/              # ⏳ v0.4 仅提供 Dialect 与 Open
+├── store/postgres/           # ⏳ v0.4
+├── store/sqlite/             # ⏳ v0.4
+│
 ├── examples/01-quickstart/   # 零依赖可运行示例
 └── docs/
-    ├── design-decisions.md   # 28 条 ADR：每个"刻意为之"的取舍与代价
+    ├── design-decisions.md   # 34 条 ADR：每个"刻意为之"的取舍与代价
     └── invariants.md         # ⏳ 形式化描述（当前以 selfcheck.go 的测试为准）
 ```
 

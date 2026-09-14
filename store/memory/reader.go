@@ -243,28 +243,16 @@ func (r *reader) CountCommissionsByState(ctx context.Context, tenantID int64) (m
 	return out, nil
 }
 
+// Tenants reads the tenant registry directly.
+//
+// It used to derive the list by scanning four maps on every call, which made
+// Maintain proportional to the entire data set on a per-minute timer.
 func (r *reader) Tenants(ctx context.Context) ([]int64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	seen := make(map[int64]struct{})
-	for k := range r.d.agents {
-		seen[k.TenantID] = struct{}{}
-	}
-	for k := range r.d.bindings {
-		seen[k.TenantID] = struct{}{}
-	}
-	for k := range r.d.accounts {
-		seen[k.TenantID] = struct{}{}
-	}
-	for k := range r.d.byOrder {
-		seen[k.TenantID] = struct{}{}
-	}
-	out := make([]int64, 0, len(seen))
-	for t := range seen {
-		out = append(out, t)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	out := make([]int64, len(r.d.tenants))
+	copy(out, r.d.tenants)
 	return out, nil
 }
 

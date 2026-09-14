@@ -12,9 +12,16 @@
 ## [Unreleased]
 
 ### Planned
-- v0.4 MySQL Store（事务、行锁、`Migrate`、`schema.sql`）
+- v0.4 模块化 SQL 存储：一个可移植内核 `store/sql`（语句拼装、行扫描、事务与重试、乐观锁、幂等冲突处理），
+  加上 `store/mysql`、`store/postgres`、`store/sqlite` 三个薄方言包，各自只提供占位符、upsert 形式、
+  重复键与可重试错误的判定、标识符引用与建表 DDL。新增后端 = 写一个方言，而不是再写一个 store（ADR-033）
 - v0.5 提现链路与 `PayoutChannel`（含「已出账后追回」的欠款策略）
 - v0.6 可观测性钩子 + `examples` 补齐 02–05
+
+### Changed
+- **`Reader.Tenants()` 的契约收紧**：必须维护租户登记表，不得通过扫描数据集回答。
+  原内存实现遍历四张 map 取并集，在内存里只是「有点慢」，在 SQL 上却是每分钟一次跨大表去重。
+  内存实现已改为首次写入时登记（ADR-034）。
 
 ---
 

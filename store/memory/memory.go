@@ -92,6 +92,14 @@ type data struct {
 	ledgerByUser   map[distledger.UserKey][]int64
 	ledgerByTenant map[int64][]int64
 
+	// tenants is the ascending registry of tenant IDs that have been written to.
+	//
+	// It exists because Maintain asks for the tenant list on every tick: deriving
+	// it by scanning every map would make the heartbeat proportional to the whole
+	// data set, and the same query against SQL would need a UNION over several
+	// tables instead of one indexed lookup.
+	tenants []int64
+
 	// accountIDs is an ordered index over accounts, sorted by (tenant, user).
 	//
 	// It exists so keyset pagination does not re-sort every account on every
@@ -296,6 +304,7 @@ type undo struct {
 	// Ordered indexes: hybrid snapshots.
 	due        orderedUndo[dueRef]
 	accountIDs orderedUndo[distledger.UserKey]
+	tenants    orderedUndo[int64]
 
 	nextID int64
 }
@@ -431,6 +440,7 @@ func (u *undo) rollback(d *data) {
 
 	d.pendingDue = u.due.restore(d.pendingDue)
 	d.accountIDs = u.accountIDs.restore(d.accountIDs)
+	d.tenants = u.tenants.restore(d.tenants)
 	d.nextID = u.nextID
 }
 

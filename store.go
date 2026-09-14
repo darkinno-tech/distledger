@@ -161,9 +161,19 @@ type Reader interface {
 	// Tenants returns every tenant ID that has appeared in the library, in
 	// ascending order.
 	//
-	// Maintain and SelfCheck need to walk all tenants. The library deliberately
-	// keeps no separate tenant table: tenants belong to the caller's domain
-	// model, and this library only treats them as a data partition key.
+	// Maintain calls this on every tick, so an implementation MUST answer it
+	// without scanning the data set. Keep a registry of the tenants written to so
+	// far, updated when a tenant is first written to; do not compute the list by
+	// scanning agents, accounts and commissions and taking the union of their
+	// tenant IDs.
+	//
+	// A SQL backend makes the requirement concrete: the union form needs a
+	// DISTINCT over several large tables, while a registry table is one indexed
+	// lookup of a handful of rows.
+	//
+	// The library still keeps no tenant *entity*: tenants belong to the caller's
+	// domain model, and this library only treats them as a data partition key.
+	// The registry is an index, nothing more.
 	Tenants(ctx context.Context) ([]int64, error)
 }
 
