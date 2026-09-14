@@ -18,8 +18,9 @@ import (
 //
 //  1. SelfCheck passes completely (balance == ledger sum, no negative
 //     balances, no dangling references, no cap violations).
-//  2. Each pending commission's account balance agrees with the sum of that
-//     agent's commissions.
+//  2. Every agent's four balance buckets sum to the total of that agent's
+//     commission records, so the money on the books equals the money the
+//     commission ledger says they earned.
 //
 // Failures print the random seed so they can be reproduced exactly.
 func TestRandomEventSequencePreservesInvariants(t *testing.T) {
