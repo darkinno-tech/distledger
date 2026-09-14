@@ -29,6 +29,11 @@ type InvariantResult struct {
 	// TotalViolations is the total number of violations, which may exceed
 	// len(Violations).
 	TotalViolations int
+	// Notes are observations that are not violations and do not affect OK.
+	//
+	// The one producer today is a debt carried under Rules.AllowNegative: a
+	// negative withdrawable balance the rules permit. Visible, not failing.
+	Notes []string
 }
 
 func (r *InvariantResult) add(format string, args ...any) {
@@ -37,6 +42,20 @@ func (r *InvariantResult) add(format string, args ...any) {
 		r.Violations = append(r.Violations, fmt.Sprintf(format, args...))
 	}
 	r.OK = false
+}
+
+// note records something worth seeing that is not a violation.
+//
+// It exists for exactly one case, and the reason is worth stating: when
+// Rules.AllowNegative is set, an account whose withdrawable bucket is negative
+// is carrying a debt the rules permit. That is not an inconsistency, so it must
+// not fail the check - but a balance below zero is alarming enough that
+// silently accepting it would be its own kind of bug. A note is the honest
+// middle: reported, and not counted against the invariant.
+func (r *InvariantResult) note(format string, args ...any) {
+	if len(r.Notes) < maxViolationsPerCheck {
+		r.Notes = append(r.Notes, fmt.Sprintf(format, args...))
+	}
 }
 
 // Report is the result of SelfCheck.
@@ -136,6 +155,12 @@ func (l *Ledger) SelfCheck(ctx context.Context, tenantID int64) (Report, error) 
 			return err
 		}
 		rep.Invariants = append(rep.Invariants, i3)
+
+		i4, err := l.checkWithdrawalReconciliation(ctx, r, tenantID)
+		if err != nil {
+			return err
+		}
+		rep.Invariants = append(rep.Invariants, i4)
 		return nil
 	})
 	if err != nil {
@@ -224,7 +249,7 @@ func (l *Ledger) checkLedgerConservation(ctx context.Context, r Reader, tenantID
 				}
 			}
 
-			accountConservationViolations(&res, acct, sums, last, entries)
+			accountConservationViolations(&res, acct, sums, last, entries, l.rules.AllowNegative)
 		}
 		if len(accounts) < MaxPageLimit {
 			break
@@ -243,14 +268,28 @@ func (l *Ledger) checkLedgerConservation(ctx context.Context, r Reader, tenantID
 // highest-id entry, and entries is how many entries it has. When entries is zero
 // there is no tail and sums are all zero, which is why the zero-entry case is
 // decided from the account alone.
-func accountConservationViolations(res *InvariantResult, acct Account, sums Account, tail LedgerEntry, entries int) {
+func accountConservationViolations(
+	res *InvariantResult, acct Account, sums Account, tail LedgerEntry, entries int,
+	allowNegative bool,
+) {
 	buckets := AllBuckets()
 
 	if !acct.Settleable() {
 		for _, b := range buckets {
-			if v := b.Value(acct); v < 0 {
-				res.add("account %s has a negative %s bucket: %s", acct.Key, b, v)
+			v := b.Value(acct)
+			if v >= 0 {
+				continue
 			}
+			// A debt is only ever permitted in the withdrawable bucket, and
+			// only when the rules say so. Any other bucket below zero means a
+			// commission was clawed back twice, which is a bug rather than a
+			// debt - so it stays a violation either way.
+			if allowNegative && b == BucketAvailable {
+				res.note("account %s carries a debt of %s in the %s bucket, "+
+					"permitted by Rules.AllowNegative", acct.Key, v, b)
+				continue
+			}
+			res.add("account %s has a negative %s bucket: %s", acct.Key, b, v)
 		}
 	}
 
@@ -291,7 +330,8 @@ func (l *Ledger) checkLedgerConservationReconciled(
 	res := InvariantResult{Name: "I1: account balance equals sum of ledger deltas", OK: true}
 
 	examined, err := rec.ReconcileAccounts(ctx, tenantID, MaxPageLimit, func(m AccountReconciliation) error {
-		accountConservationViolations(&res, m.Stored, m.Summed, m.Tail, entriesFromTail(m))
+		accountConservationViolations(&res, m.Stored, m.Summed, m.Tail, entriesFromTail(m),
+			l.rules.AllowNegative)
 		return nil
 	})
 	if err != nil {
@@ -315,6 +355,165 @@ func entriesFromTail(m AccountReconciliation) int {
 		return 1
 	}
 	return 0
+}
+
+// checkWithdrawalReconciliation verifies invariant I4.
+//
+// # What it covers that no other invariant does
+//
+// A withdrawal is the one record in this library whose state claims something
+// about money *outside* the account: Paid means the money has left the
+// platform. Every other state is a promise the account can still be checked
+// against, but a paid withdrawal has already gone.
+//
+// Two things therefore have to be verified, and they fail in different ways.
+//
+// **The reservation must match the bucket.** The withdrawable account's
+// reserved bucket holds exactly the money of the withdrawals that are still
+// reserved. If a withdrawal is marked paid without the money being moved - which
+// is what a half-applied payout leaves behind - the bucket disagrees with the
+// sum and this catches it. The state machine cannot: the transition is legal,
+// and only the money is missing.
+//
+// **The ledger must corroborate the state.** A reserved withdrawal must have a
+// hold entry, a paid one a paid entry, a rejected one a refund entry. A state
+// without its entry means the two halves of the library disagree about what
+// happened.
+func (l *Ledger) checkWithdrawalReconciliation(
+	ctx context.Context, r Reader, tenantID int64,
+) (InvariantResult, error) {
+	res := InvariantResult{Name: "I4: withdrawal state, reservation and ledger agree", OK: true}
+
+	// The ledger's withdraw entries, indexed by the withdrawal they reference.
+	// Walking the tenant's ledger once is the same cost as I1's walk, and it
+	// avoids a read per withdrawal.
+	holds := map[int64]bool{}
+	paids := map[int64]bool{}
+	refunds := map[int64]bool{}
+	var afterEntry int64
+	for {
+		page, err := r.LedgerByTenant(ctx, tenantID, Page{AfterID: afterEntry, Limit: MaxPageLimit})
+		if err != nil {
+			return res, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, e := range page {
+			afterEntry = e.ID
+			// Filter before parsing. A manual adjustment carries a free-form
+			// BizID, so parsing every entry turns one into a reported defect.
+			if !e.BizType.referencesWithdrawal() {
+				continue
+			}
+			id, err := strconv.ParseInt(e.BizID, 10, 64)
+			if err != nil {
+				// A withdraw entry whose reference is not a number cannot be
+				// matched to anything, which is itself worth reporting: it means
+				// the state and the money have no way back to each other.
+				res.add("ledger entry #%d is a withdrawal entry with non-numeric biz id %q",
+					e.ID, e.BizID)
+				continue
+			}
+			switch e.BizType {
+			case LedgerWithdrawHold:
+				holds[id] = true
+			case LedgerWithdrawPaid:
+				paids[id] = true
+			case LedgerWithdrawRefund:
+				refunds[id] = true
+			}
+		}
+		if len(page) < MaxPageLimit {
+			break
+		}
+	}
+
+	reserved := map[UserKey]Money{}
+	var afterID int64
+	for {
+		page, err := r.WithdrawalsByTenant(ctx, tenantID, Page{AfterID: afterID, Limit: MaxPageLimit})
+		if err != nil {
+			return res, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, w := range page {
+			afterID = w.ID
+			res.Checked++
+
+			if w.State == WithdrawalPaid && w.PaidAt.IsZero() {
+				res.add("withdrawal %d is paid but records no payout time", w.ID)
+			}
+			if w.State != WithdrawalPaid && !w.PaidAt.IsZero() {
+				res.add("withdrawal %d records a payout time but is %s", w.ID, w.State)
+			}
+			// Every withdrawal that moved money must have its hold entry; it is
+			// written in the same transaction as the reservation, so a missing
+			// one means the transaction was not atomic.
+			if !holds[w.ID] {
+				res.add("withdrawal %d has no hold ledger entry, so its reservation is not on the ledger",
+					w.ID)
+			}
+			switch w.State {
+			case WithdrawalPaid:
+				if !paids[w.ID] {
+					res.add("withdrawal %d is paid but has no paid ledger entry: the money never moved",
+						w.ID)
+				}
+			case WithdrawalRejected:
+				if !refunds[w.ID] {
+					res.add("withdrawal %d is rejected but has no refund ledger entry: the money never came back",
+						w.ID)
+				}
+			}
+			if amount := w.Outstanding(); amount > 0 {
+				sum, err := reserved[w.Key].Add(amount)
+				if err != nil {
+					return res, err
+				}
+				reserved[w.Key] = sum
+			}
+		}
+		if len(page) < MaxPageLimit {
+			break
+		}
+	}
+
+	// The money half: the reserved bucket must hold exactly the outstanding
+	// withdrawals. Accounts are enumerated from the account side so that an
+	// account with reserved money and no withdrawal - the case a deleted or
+	// never-written withdrawal leaves - is caught too.
+	var afterUserID int64
+	for {
+		accounts, err := r.AccountsByTenant(ctx, tenantID, AccountPage{
+			AfterUserID: afterUserID, Limit: MaxPageLimit,
+		})
+		if err != nil {
+			return res, err
+		}
+		if len(accounts) == 0 {
+			break
+		}
+		for _, acct := range accounts {
+			afterUserID = acct.Key.UserID
+			// Counted because the money comparison below is a real check even
+			// when the tenant has no withdrawals: it is what proves the bucket
+			// is empty because nothing reserved it, rather than because the
+			// query found nothing.
+			res.Checked++
+			want := reserved[acct.Key]
+			if got := acct.Withdrawing; got != want {
+				res.add("account %s holds %s in the withdrawing bucket but its outstanding "+
+					"withdrawals total %s", acct.Key, got, want)
+			}
+		}
+		if len(accounts) < MaxPageLimit {
+			break
+		}
+	}
+	return res, nil
 }
 
 // allocKey is the grouping key of the allocation check.

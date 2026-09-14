@@ -71,6 +71,41 @@ type Rules struct {
 	// BindExpireDays is the validity period of a buyer binding, in days.
 	// 0 means it never expires. Default 0.
 	BindExpireDays int
+
+	// MinWithdraw is the smallest withdrawal that will be accepted, in minor
+	// units. Default 10000 (100.00).
+	//
+	// The default exists because the alternative is worse: with no minimum an
+	// agent can request a payout of one cent and the transfer fee exceeds the
+	// amount. It is a real value rather than "no limit" so the conservative
+	// behavior needs no configuration, matching ADR-010's principle.
+	MinWithdraw Money
+
+	// FeeRateBP is the platform's cut of a withdrawal, in basis points.
+	// Default 0.
+	//
+	// Zero is the default because charging by accident is the failure this
+	// library refuses to have. Setting it is a deliberate act.
+	FeeRateBP Rate
+
+	// AllowNegative governs what happens when a refund has to claw back money
+	// that has already been paid out. Default false.
+	//
+	// False means the clawback is refused: the buckets may not go below zero, so
+	// a reversal that the account cannot cover fails loudly with the shortfall
+	// named, and the caller recovers it out of band. The books are then
+	// incomplete until they do - the reversal is not recorded - but nothing is
+	// silently wrong, which is the trade this library makes everywhere else.
+	//
+	// True means the debt is represented: the withdrawable bucket is allowed to
+	// go negative, and future earnings pay it off as they arrive. The books stay
+	// complete at the cost of a balance an operator may not expect.
+	//
+	// Neither default is free, so this is configurable rather than decided here.
+	// Only the withdrawable bucket may go negative, and only under this rule: a
+	// frozen bucket that goes negative would mean a commission was clawed back
+	// twice, which is a bug rather than a debt. See ADR-042.
+	AllowNegative bool
 }
 
 // DefaultRules returns the conservative default rules.
@@ -87,6 +122,9 @@ func DefaultRules() Rules {
 		FreezeDays:       7,
 		MaxAllocatableBP: MaxRateBP,
 		BindExpireDays:   0,
+		MinWithdraw:      10000,
+		FeeRateBP:        0,
+		AllowNegative:    false,
 	}
 }
 

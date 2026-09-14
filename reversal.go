@@ -3,6 +3,7 @@ package distledger
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"time"
@@ -493,9 +494,34 @@ func (l *Ledger) debitBucket(
 	// is far harder to clean up than one failed clawback. RequireNonNegative
 	// makes that a guard on the statement itself.
 	//
-	// In v0.3 this path is unreachable - with no withdrawals the money is always
-	// still in the bucket. It is a safety net for v0.5, where a commission can be
-	// paid out before its order is refunded.
+	// Until v0.5 this path was unreachable, because with no withdrawals the
+	// money was always still in the bucket. Withdrawals make it reachable: a
+	// settled commission can now be paid out before its order is refunded.
+	//
+	// # The debt policy
+	//
+	// So the guard can fail for a legitimate reason, and there are two ways to
+	// answer. Rules.AllowNegative chooses.
+	//
+	// False (the default): refuse, and say by how much. The reversal is not
+	// recorded, so the books do not yet reflect a refund that really happened -
+	// incomplete, but not silently wrong, and the caller is told the exact
+	// shortfall to recover. This library fails loudly everywhere else, and a
+	// ledger that quietly invents a debt is worse than one that says it cannot
+	// proceed.
+	//
+	// True: represent the debt. The withdrawable bucket is allowed to go
+	// negative and future earnings pay it off as they arrive. The books stay
+	// complete, at the cost of a balance an operator may not expect.
+	//
+	// Only the withdrawable bucket may go negative under that rule, and only
+	// here. A frozen bucket below zero would mean a commission was clawed back
+	// twice, which is a bug rather than a debt, and letting that through would
+	// turn a real defect into a number somebody has to interpret.
+	//
+	// The guarded attempt is made first in both modes. The debt is taken only
+	// after the safe version has failed and the rules permit it, so a platform
+	// that never sets AllowNegative cannot be affected by its existence.
 	clawback := AccountDelta{
 		Key:                key,
 		TotalReversed:      delta,
@@ -506,7 +532,28 @@ func (l *Ledger) debitBucket(
 
 	saved, err := tx.IncrementAccount(ctx, clawback)
 	if err != nil {
-		return err
+		if !errors.Is(err, ErrInsufficientBalance) {
+			return err
+		}
+		if !l.rules.AllowNegative || bucket != BucketAvailable {
+			return fmt.Errorf(
+				"%w: reversing %s of commission %d needs %s in the %s bucket of account %s, "+
+					"which the account cannot cover; the money was probably already paid out. "+
+					"Recover it out of band, or set Rules.AllowNegative to let the account carry the debt",
+				err, delta, original.ID, delta, bucket, key)
+		}
+		// The debt is permitted. Take it, and record why, because a negative
+		// balance with no explanation is indistinguishable from corruption.
+		reason = reason + " (uncovered: money already paid out)"
+		clawback.RequireNonNegative = false
+		saved, err = tx.IncrementAccount(ctx, clawback)
+		if err != nil {
+			return err
+		}
+		l.log.WarnContext(ctx, "reversal created a debt",
+			"user_id", key.UserID, "commission_id", original.ID,
+			"amount", delta.String(), "bucket", bucket.String(),
+			"available_after", saved.Available.String())
 	}
 
 	bizType := LedgerReverse

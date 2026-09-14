@@ -23,10 +23,11 @@ const idemKeyVersion = "v1"
 // legal state machine transitions plus version CAS, because they are already
 // idempotent and need no extra key.
 const (
-	nsAccrue  = "accrue"
-	nsReverse = "reverse"
-	nsRefund  = "refund"
-	nsUser    = "user"
+	nsAccrue   = "accrue"
+	nsReverse  = "reverse"
+	nsRefund   = "refund"
+	nsWithdraw = "withdraw"
+	nsUser     = "user"
 )
 
 // idemKeyLen is the hex length of the final idempotency key (32 characters =
@@ -123,6 +124,25 @@ func reverseIdemKey(order OrderKey, itemID string, agentUserID int64, layer int,
 // The caller's key identifies the refund event; the item id makes it unique per
 // accrual item, because one refund event distributes across several items and
 // each gets its own voucher.
+// withdrawIdemKey derives the key that makes a withdrawal request idempotent.
+//
+// It is also handed to the payout channel as the idempotency key for the payout
+// itself, so that one identifier covers both the request and the transfer it
+// causes. That is deliberate: a channel keyed on anything else could pay twice
+// for one withdrawal.
+// It is scoped to the tenant and nothing else, because that is exactly what the
+// storage unique index covers: UNIQUE(tenant_id, idem_key). A key that embedded
+// the user id would be unique for a reason the schema does not enforce, and —
+// as this did until a test caught it — could not be looked up by a caller who
+// knows only its tenant and its own key.
+//
+// The consequence to know about: within one tenant a caller key identifies one
+// request, so two users of the same tenant cannot both use "wd-1". That is the
+// contract, and it is the same one refunds use.
+func withdrawIdemKey(tenantID int64, callerKey string) string {
+	return hashParts(idemKeyVersion, nsWithdraw, i64s(tenantID), callerKey)
+}
+
 func refundIdemKey(order OrderKey, itemID, callerKey string) string {
 	return hashParts(idemKeyVersion, nsRefund, i64s(order.TenantID), order.OrderID, itemID, callerKey)
 }

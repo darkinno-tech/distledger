@@ -41,8 +41,8 @@ func TestSelfCheckPassesOnHealthyData(t *testing.T) {
 	if rep.StoreKind != "memory" {
 		t.Errorf("store kind = %q, want memory", rep.StoreKind)
 	}
-	if len(rep.Invariants) != 3 {
-		t.Fatalf("got %d invariants, want 3", len(rep.Invariants))
+	if len(rep.Invariants) != 4 {
+		t.Fatalf("got %d invariants, want 4", len(rep.Invariants))
 	}
 	for _, inv := range rep.Invariants {
 		if !inv.OK {

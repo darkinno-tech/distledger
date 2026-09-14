@@ -713,3 +713,268 @@ func findInvariant(rep distledger.Report, prefix string) (distledger.InvariantRe
 	}
 	return distledger.InvariantResult{}, false
 }
+
+// TestEngineWithdrawalLifecycle runs the payout path against every backend.
+//
+// The withdrawal port methods are new, and the SQL implementations of them have
+// never been executed against a real database until this test. That is the whole
+// reason it exists: an in-memory implementation that satisfies the interface
+// says nothing about whether the generated SQL parses, whether the placeholders
+// line up, or whether the nullable columns scan.
+func TestEngineWithdrawalLifecycle(t *testing.T) {
+	for _, b := range backends(t) {
+		t.Run(b.name, func(t *testing.T) {
+			ctx := context.Background()
+			ch := &distledger.MockChannel{}
+			led, clock := newPayoutEngine(t, b, ch)
+
+			if _, err := led.BindAgent(ctx, distledger.BindAgentRequest{
+				TenantID: engineTenant, UserID: 3001, Status: distledger.AgentActive,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := led.BindBuyer(ctx, distledger.BindBuyerRequest{
+				TenantID: engineTenant, BuyerUserID: 4001, AgentUserID: 3001,
+				Source: distledger.SourceLink,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := led.OnOrderPaid(ctx, distledger.OrderPaidEvent{
+				TenantID: engineTenant, OrderID: "ORD-W1", BuyerUserID: 4001,
+				PaidAmount: 100000, PaidAt: clock.Now(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := led.OnOrderReceived(ctx, distledger.OrderReceivedEvent{
+				TenantID: engineTenant, OrderID: "ORD-W1", ReceivedAt: clock.Now(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			clock.Advance(8 * 24 * time.Hour)
+			if _, err := led.Maintain(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			before, err := led.Balance(ctx, engineTenant, 3001)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if before.Available < 2000 {
+				t.Fatalf("nothing to withdraw: %+v", before)
+			}
+			amount := before.Available / 2
+
+			// Reserve.
+			w, existed, err := led.RequestWithdraw(ctx, distledger.WithdrawRequest{
+				TenantID: engineTenant, UserID: 3001, Amount: amount, IdemKey: "wd-1",
+			})
+			if err != nil {
+				t.Fatalf("RequestWithdraw: %v", err)
+			}
+			if existed || w.ID == 0 {
+				t.Fatalf("unexpected append result: existed=%v id=%d", existed, w.ID)
+			}
+
+			// A retry must return the same withdrawal and reserve nothing more.
+			again, existed, err := led.RequestWithdraw(ctx, distledger.WithdrawRequest{
+				TenantID: engineTenant, UserID: 3001, Amount: amount, IdemKey: "wd-1",
+			})
+			if err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+			if !existed || again.ID != w.ID {
+				t.Fatalf("a retry must return the same withdrawal: existed=%v id=%d want %d",
+					existed, again.ID, w.ID)
+			}
+			reserved, err := led.Balance(ctx, engineTenant, 3001)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reserved.Withdrawing != amount || reserved.Available != before.Available-amount {
+				t.Fatalf("the retry reserved the money twice: %+v", reserved)
+			}
+
+			// A lookup by the caller's own key must work, which on SQL means the
+			// idempotency key was stored in the form the index expects.
+			byKey, err := led.WithdrawalByIdemKey(ctx, engineTenant, "wd-1")
+			if err != nil {
+				t.Fatalf("WithdrawalByIdemKey: %v", err)
+			}
+			if byKey.ID != w.ID {
+				t.Fatalf("lookup by caller key returned %d, want %d", byKey.ID, w.ID)
+			}
+
+			// Review, then pay.
+			if _, err := led.ApproveWithdraw(ctx, distledger.WithdrawDecision{
+				TenantID: engineTenant, WithdrawalID: w.ID, Operator: "alice",
+			}); err != nil {
+				t.Fatalf("ApproveWithdraw: %v", err)
+			}
+			paid, err := led.PayWithdraw(ctx, distledger.PayoutOutcome{
+				TenantID: engineTenant, WithdrawalID: w.ID, Operator: "alice",
+			})
+			if err != nil {
+				t.Fatalf("PayWithdraw: %v", err)
+			}
+			if paid.State != distledger.WithdrawalPaid {
+				t.Fatalf("state = %s, want paid", paid.State)
+			}
+			if paid.PaidAt.IsZero() {
+				t.Fatal("a paid withdrawal must record when it was paid")
+			}
+
+			final, err := led.Balance(ctx, engineTenant, 3001)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if final.Withdrawing != 0 {
+				t.Errorf("withdrawing = %s, want 0", final.Withdrawing)
+			}
+			if final.Withdrawn != before.Withdrawn+amount {
+				t.Errorf("withdrawn = %s, want %s", final.Withdrawn, before.Withdrawn+amount)
+			}
+
+			// The whole cycle must leave the books consistent on this backend.
+			rep, err := led.SelfCheck(ctx, engineTenant)
+			if err != nil {
+				t.Fatalf("SelfCheck: %v", err)
+			}
+			if !rep.OK {
+				t.Fatalf("invariants failed after a withdrawal: %+v", rep.Invariants)
+			}
+			if len(rep.Invariants) != 4 {
+				t.Fatalf("got %d invariants, want 4", len(rep.Invariants))
+			}
+
+			// The reads an operator queue depends on.
+			list, err := led.Withdrawals(ctx, engineTenant, distledger.Page{})
+			if err != nil {
+				t.Fatalf("Withdrawals: %v", err)
+			}
+			if len(list) != 1 || list[0].ID != w.ID {
+				t.Fatalf("Withdrawals returned %d rows, want 1 with id %d", len(list), w.ID)
+			}
+		})
+	}
+}
+
+// TestEngineWithdrawalPayFailureIsRetryableOnEveryBackend covers the failure
+// path in SQL, including the transition out of PayFailed, which is the one that
+// leaves money reserved if the store gets it wrong.
+func TestEngineWithdrawalPayFailureIsRetryableOnEveryBackend(t *testing.T) {
+	for _, b := range backends(t) {
+		t.Run(b.name, func(t *testing.T) {
+			ctx := context.Background()
+			ch := &distledger.MockChannel{Fail: true}
+			led, clock := newPayoutEngine(t, b, ch)
+
+			if _, err := led.BindAgent(ctx, distledger.BindAgentRequest{
+				TenantID: engineTenant, UserID: 3001, Status: distledger.AgentActive,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := led.BindBuyer(ctx, distledger.BindBuyerRequest{
+				TenantID: engineTenant, BuyerUserID: 4001, AgentUserID: 3001,
+				Source: distledger.SourceLink,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := led.OnOrderPaid(ctx, distledger.OrderPaidEvent{
+				TenantID: engineTenant, OrderID: "ORD-W2", BuyerUserID: 4001,
+				PaidAmount: 100000, PaidAt: clock.Now(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := led.OnOrderReceived(ctx, distledger.OrderReceivedEvent{
+				TenantID: engineTenant, OrderID: "ORD-W2", ReceivedAt: clock.Now(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			clock.Advance(8 * 24 * time.Hour)
+			if _, err := led.Maintain(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			bal, err := led.Balance(ctx, engineTenant, 3001)
+			if err != nil {
+				t.Fatal(err)
+			}
+			amount := bal.Available
+
+			w, _, err := led.RequestWithdraw(ctx, distledger.WithdrawRequest{
+				TenantID: engineTenant, UserID: 3001, Amount: amount, IdemKey: "wd-fail",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := led.ApproveWithdraw(ctx, distledger.WithdrawDecision{
+				TenantID: engineTenant, WithdrawalID: w.ID, Operator: "alice",
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			failed, err := led.PayWithdraw(ctx, distledger.PayoutOutcome{
+				TenantID: engineTenant, WithdrawalID: w.ID, Operator: "alice",
+			})
+			if err != nil {
+				t.Fatalf("a channel-reported failure is an outcome, not an error: %v", err)
+			}
+			if failed.State != distledger.WithdrawalPayFailed || failed.FailReason == "" {
+				t.Fatalf("want pay_failed with a reason, got %+v", failed)
+			}
+
+			// Retry: this exercises a transition out of PayFailed in SQL.
+			ch.Fail = false
+			paid, err := led.PayWithdraw(ctx, distledger.PayoutOutcome{
+				TenantID: engineTenant, WithdrawalID: w.ID, Operator: "alice",
+			})
+			if err != nil {
+				t.Fatalf("retry after a failure: %v", err)
+			}
+			if paid.State != distledger.WithdrawalPaid {
+				t.Fatalf("after retry state = %s, want paid", paid.State)
+			}
+			final, err := led.Balance(ctx, engineTenant, 3001)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if final.Withdrawing != 0 || final.Withdrawn != amount {
+				t.Fatalf("after the retry: withdrawing %s, withdrawn %s; want 0 and %s",
+					final.Withdrawing, final.Withdrawn, amount)
+			}
+			rep, err := led.SelfCheck(ctx, engineTenant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !rep.OK {
+				t.Fatalf("invariants failed after a retried payout: %+v", rep.Invariants)
+			}
+		})
+	}
+}
+
+// newPayoutEngine is newEngine with a payout channel and a withdrawal minimum
+// low enough for the fixture's balances.
+func newPayoutEngine(
+	t *testing.T, b backend, ch distledger.PayoutChannel,
+) (*distledger.Ledger, *distledger.ManualClock) {
+	t.Helper()
+	clock := distledger.NewManualClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	rules := distledger.Rules{
+		Levels:      3,
+		RateBP:      []distledger.Rate{500, 200, 100},
+		FreezeDays:  7,
+		MinWithdraw: 1000,
+	}
+	led, err := distledger.New(distledger.Config{
+		Store:  b.open(t),
+		Clock:  clock,
+		Rules:  rules,
+		Payout: ch,
+	})
+	if err != nil {
+		t.Fatalf("new ledger: %v", err)
+	}
+	t.Cleanup(func() { _ = led.Close() })
+	return led, clock
+}

@@ -33,6 +33,15 @@ type Config struct {
 	// Eligibility decides whether an agent is eligible for a commission.
 	// When empty, the agent is required to be in AgentActive state.
 	Eligibility EligibilityChecker
+	// Payout is the channel used by PayWithdraw.
+	//
+	// Empty means automatic payout is not configured: PayWithdraw returns
+	// ErrNoPayoutChannel, while RequestWithdraw, ApproveWithdraw, RejectWithdraw
+	// and MarkWithdrawPaid all still work. That is the right default for a
+	// platform that pays by hand, and it is the conservative one - ADR-010's
+	// principle is that money should not leave without somebody deciding it
+	// should, and an unconfigured channel cannot leak it.
+	Payout PayoutChannel
 }
 
 // Ledger is the public facade of the distribution ledger kernel.
@@ -46,6 +55,10 @@ type Ledger struct {
 	log   *slog.Logger
 	rates RateResolver
 	elig  EligibilityChecker
+	// payout is the channel used by PayWithdraw. Nil means automatic payout is
+	// not configured; MarkWithdrawPaid still works, and that is the right
+	// default for a platform that pays by hand (ADR-010).
+	payout PayoutChannel
 	// ruleVersion is the content fingerprint of the rule set, computed once at
 	// construction so that the hot paths do not recompute the SHA-256.
 	ruleVersion int64
@@ -90,6 +103,7 @@ func New(cfg Config) (*Ledger, error) {
 		log:         logger,
 		rates:       rates,
 		elig:        elig,
+		payout:      cfg.Payout,
 		ruleVersion: rules.Version(),
 	}, nil
 }

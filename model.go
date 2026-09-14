@@ -672,6 +672,22 @@ func (t LedgerBizType) referencesCommission() bool {
 	}
 }
 
+// referencesWithdrawal reports whether a ledger entry's BizID points at a
+// withdrawal record.
+//
+// It exists so that "which ids does this entry reference" is asked in one place.
+// Without it, code that parses BizID for withdrawals has to remember to filter
+// by type first - and forgetting means every manual adjustment, whose BizID is
+// a free-form string, gets reported as a malformed withdrawal reference.
+func (t LedgerBizType) referencesWithdrawal() bool {
+	switch t {
+	case LedgerWithdrawHold, LedgerWithdrawPaid, LedgerWithdrawRefund:
+		return true
+	default:
+		return false
+	}
+}
+
 // LedgerEntry is one record of the money ledger.
 //
 // It is the landing point of **double-entry bookkeeping**: every change to an

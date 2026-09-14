@@ -27,6 +27,13 @@ var (
 	// a normal return of "success with no side effects".
 	ErrDuplicate = errors.New("distledger: duplicate idempotency key")
 
+	// ErrNoPayoutChannel reports that automatic payout was attempted without a
+	// channel configured.
+	//
+	// It is its own error rather than a generic refusal because the fix is a
+	// configuration step, not a retry: a caller that retried would wait forever.
+	ErrNoPayoutChannel = errors.New("distledger: no payout channel configured")
+
 	// ErrIllegalTransition reports an illegal state transition.
 	//
 	// The library never guesses at intent: an illegal transition is always an error,
