@@ -20,8 +20,9 @@ func TestCommissionTransitionMatrix(t *testing.T) {
 			CommissionVoid:     true,
 		},
 		CommissionSettled: {
-			CommissionWithdrawn: true,
-			CommissionReversed:  true,
+			// No "withdrawn" edge: a withdrawal is an amount against the
+			// account, not a commission state (ADR-044).
+			CommissionReversed: true,
 		},
 		CommissionFrozen: {
 			CommissionPending: true,
@@ -32,9 +33,8 @@ func TestCommissionTransitionMatrix(t *testing.T) {
 			// neither payable nor recoverable.
 			CommissionReversed: true,
 		},
-		CommissionWithdrawn: {},
-		CommissionReversed:  {},
-		CommissionVoid:      {},
+		CommissionReversed: {},
+		CommissionVoid:     {},
 	}
 
 	states := AllCommissionStates()
@@ -67,9 +67,8 @@ func TestSelfTransitionAlwaysRejected(t *testing.T) {
 
 func TestTerminalStates(t *testing.T) {
 	terminal := map[CommissionState]bool{
-		CommissionWithdrawn: true,
-		CommissionReversed:  true,
-		CommissionVoid:      true,
+		CommissionReversed: true,
+		CommissionVoid:     true,
 	}
 	for _, s := range AllCommissionStates() {
 		if s.Terminal() != terminal[s] {
@@ -84,7 +83,7 @@ func TestTerminalStates(t *testing.T) {
 }
 
 func TestValidateCommissionTransitionError(t *testing.T) {
-	err := ValidateCommissionTransition(CommissionWithdrawn, CommissionPending)
+	err := ValidateCommissionTransition(CommissionVoid, CommissionPending)
 	if !errors.Is(err, ErrIllegalTransition) {
 		t.Fatalf("expected ErrIllegalTransition, got %v", err)
 	}
@@ -92,7 +91,7 @@ func TestValidateCommissionTransitionError(t *testing.T) {
 	if !errors.As(err, &te) {
 		t.Fatalf("expected *TransitionError, got %T", err)
 	}
-	if te.From != "withdrawn" || te.To != "pending" {
+	if te.From != "void" || te.To != "pending" {
 		t.Fatalf("unexpected transition error payload: %+v", te)
 	}
 

@@ -67,53 +67,83 @@ func TestRiskControlRejectsOverLongReason(t *testing.T) {
 	}
 }
 
-// TestClawbackSkipsPaidOutCommissions pins the branch that becomes reachable
-// once withdrawals exist. Money that has left the platform cannot be clawed back
-// without a debt policy, so the commission is reported as skipped rather than
-// silently ignored or, worse, pushed into a negative balance.
-func TestClawbackSkipsPaidOutCommissions(t *testing.T) {
-	f := newFixture(t, distledger.Rules{Levels: 1, RateBP: []distledger.Rate{1000}, FreezeDays: 0})
+// TestRefundAfterPayoutGoesThroughTheDebtPolicy replaces a test that pinned the
+// opposite behavior.
+//
+// Until v0.2.0 a refund against an already-paid-out commission was *skipped*:
+// the commission carried a "withdrawn" state, and the clawback returned a skip
+// reason and moved no money. That looks harmless and is not - the refund really
+// happened, and skipping it drops the platform's claim on the money without
+// telling anybody.
+//
+// Withdrawals are now an amount against the account rather than a property of a
+// commission, so there is no "withdrawn" state to branch on, and the refund goes
+// where every other refund goes: to the account. What happens there is the debt
+// policy's decision (ADR-042), and this test pins the default - a loud refusal
+// naming the shortfall.
+func TestRefundAfterPayoutGoesThroughTheDebtPolicy(t *testing.T) {
+	ctx := context.Background()
+	rules := distledger.Rules{
+		Levels: 1, RateBP: []distledger.Rate{1000}, FreezeDays: 0,
+		MinWithdraw: 100,
+	}
+	f := newFixture(t, rules)
+	defer f.led.Close()
+
 	f.mustAgent(3001, 0, distledger.AgentActive)
 	f.mustBuyer(4001, 3001)
 	f.mustPay("ORD-1", 4001, 100000)
+	f.receive("ORD-1", f.clock.Now())
+	f.maintain()
 
-	commissions, err := f.led.CommissionsByOrder(context.Background(), tenant, "ORD-1")
+	bal, err := f.led.Balance(ctx, tenant, 3001)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := commissions[0].ID
-
-	// Drive the commission to Withdrawn through the store: no public API reaches
-	// that state until withdrawals land in v0.5, but the clawback must already
-	// handle it rather than corrupt an account.
-	ctx := context.Background()
-	if err := f.store.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
-		cur, err := tx.Commission(ctx, id)
-		if err != nil {
-			return err
-		}
-		cur, err = tx.TransitionCommission(ctx, id, distledger.CommissionPending, distledger.CommissionSettled, cur.Version)
-		if err != nil {
-			return err
-		}
-		_, err = tx.TransitionCommission(ctx, id, distledger.CommissionSettled, distledger.CommissionWithdrawn, cur.Version)
-		return err
+	w, _, err := f.led.RequestWithdraw(ctx, distledger.WithdrawRequest{
+		TenantID: tenant, UserID: 3001, Amount: bal.Available, IdemKey: "wd-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.led.ApproveWithdraw(ctx, distledger.WithdrawDecision{
+		TenantID: tenant, WithdrawalID: w.ID, Operator: "alice",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.led.MarkWithdrawPaid(ctx, distledger.PayoutOutcome{
+		TenantID: tenant, WithdrawalID: w.ID, Operator: "alice", InvoiceNo: "BANK-1",
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	res := f.refund(distledger.OrderRefundedEvent{OrderID: "ORD-1", IsFull: true, IdemKey: idem()})
-	if res.ReversedAmount != 0 {
-		t.Fatalf("clawed back %s from a commission that was already paid out", res.ReversedAmount)
+	// The refund is called directly rather than through f.refund, because the
+	// refusal is the point: the helper would discard the error this test is
+	// about.
+	res, err := f.led.OnOrderRefunded(ctx, distledger.OrderRefundedEvent{
+		TenantID: tenant, OrderID: "ORD-1", IsFull: true, IdemKey: idem(),
+		RefundedAt: f.clock.Now(),
+	})
+	if err == nil {
+		t.Fatalf("refunding money that has been paid out must be refused, got %+v", res)
 	}
-	var sawWithdrawn bool
-	for _, s := range res.Skipped {
-		if s.Code == distledger.SkipAlreadyWithdrawn {
-			sawWithdrawn = true
+	if !errors.Is(err, distledger.ErrInsufficientBalance) {
+		t.Fatalf("want ErrInsufficientBalance, got %v", err)
+	}
+	// Nothing may be reported as skipped: nothing was skipped, the reversal was
+	// refused and the caller was told.
+	for _, sk := range res.Skipped {
+		if strings.Contains(sk.Detail, "already paid out") {
+			t.Fatalf("a refund against a paid-out commission must not be skipped: %+v", sk)
 		}
 	}
-	if !sawWithdrawn {
-		t.Fatalf("expected distledger.SkipAlreadyWithdrawn, got %+v", res.Skipped)
+	// The books must be untouched by the refusal.
+	after, err := f.led.Balance(ctx, tenant, 3001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Available != 0 || after.Withdrawn != bal.Available {
+		t.Fatalf("a refused refund moved money: %+v", after)
 	}
 }
 

@@ -481,9 +481,13 @@ func TestTransitionRejectsIllegalMove(t *testing.T) {
 	c := seedCommission(t, s, "ORD-1", 1)
 
 	err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
-		// Pending -> Withdrawn is an illegal transition.
+		// Pending -> Pending. Both states are valid and the current state
+		// matches, so this is not a conflict and not a bad argument: it is an
+		// edge the table simply does not have. A self-transition must be
+		// rejected, because accepting it would be a no-op write that bumps the
+		// version, making a concurrent retry look like progress.
 		_, err := tx.TransitionCommission(ctx, c.ID,
-			distledger.CommissionPending, distledger.CommissionWithdrawn, c.Version)
+			distledger.CommissionPending, distledger.CommissionPending, c.Version)
 		return err
 	})
 	if !errors.Is(err, distledger.ErrIllegalTransition) {
@@ -497,9 +501,11 @@ func TestTransitionReportsConflictOnWrongCurrentState(t *testing.T) {
 	c := seedCommission(t, s, "ORD-1", 1)
 
 	err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
-		// The current state is Pending, yet the transition is issued as Settled.
+		// The current state is Pending, yet the transition is issued as
+		// Settled. That is a stale view rather than an illegal edge, so it must
+		// report a conflict.
 		_, err := tx.TransitionCommission(ctx, c.ID,
-			distledger.CommissionSettled, distledger.CommissionWithdrawn, c.Version)
+			distledger.CommissionSettled, distledger.CommissionReversed, c.Version)
 		return err
 	})
 	if !errors.Is(err, distledger.ErrConflict) {

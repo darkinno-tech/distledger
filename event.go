@@ -200,9 +200,14 @@ const (
 	// SkipFullyReversed means the reversible balance of this commission is
 	// already zero.
 	SkipFullyReversed
-	// SkipAlreadyWithdrawn means the commission has already been paid out and
+	// retiredSkipAlreadyWithdrawn (5) had no producer after the withdrawn
+	// commission state was removed, so it was dropped in v0.2.0. The numbering
+	// of the codes is not stored anywhere, so this gap is harmless - unlike the
+	// commission state values, which are persisted.
+	//
+	// skipRetired means the commission has already been paid out and
 	// clawing it back needs a debt policy.
-	SkipAlreadyWithdrawn
+	skipRetired
 )
 
 // String returns the stable identifier of the skip reason.
@@ -220,7 +225,7 @@ func (c SkipCode) String() string {
 		return "agent_missing"
 	case SkipFullyReversed:
 		return "fully_reversed"
-	case SkipAlreadyWithdrawn:
+	case skipRetired:
 		return "already_withdrawn"
 	default:
 		return "unknown"

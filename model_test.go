@@ -64,8 +64,8 @@ func TestEnumStrings(t *testing.T) {
 
 	states := map[CommissionState]string{
 		CommissionPending: "pending", CommissionSettled: "settled",
-		CommissionWithdrawn: "withdrawn", CommissionReversed: "reversed",
-		CommissionFrozen: "frozen", CommissionVoid: "void",
+		CommissionReversed: "reversed",
+		CommissionFrozen:   "frozen", CommissionVoid: "void",
 	}
 	for v, want := range states {
 		if got := v.String(); got != want {

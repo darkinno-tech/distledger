@@ -175,8 +175,19 @@ const (
 	// CommissionSettled means it is settled and counts towards the withdrawable
 	// balance.
 	CommissionSettled
-	// CommissionWithdrawn means it has been withdrawn.
-	CommissionWithdrawn
+	// commissionRetired 2 was CommissionWithdrawn. It was removed in v0.2.0,
+	// and the value is retired rather than reused: the state column stores this
+	// integer, so renumbering the states below it would make every existing
+	// database misread its own rows.
+	//
+	// It was removed because a withdrawal is an amount against a fungible
+	// balance, not a property of particular commissions. Money in the
+	// withdrawable bucket is summed across every settled commission, so
+	// attributing a payout to specific ones is arbitrary, and the only consumer
+	// of the state used it to *skip* a refund clawback - which would have
+	// silently dropped the platform's claim, the opposite of what the debt
+	// policy decides. See ADR-044.
+	commissionRetired
 	// CommissionReversed means it was reversed by a refund.
 	CommissionReversed
 	// CommissionFrozen means risk control froze it pending manual handling.
@@ -186,7 +197,14 @@ const (
 )
 
 // Valid reports whether the state is a known value.
-func (s CommissionState) Valid() bool { return s <= CommissionVoid }
+//
+// The retired value is explicitly excluded rather than merely out of range: it
+// sits below CommissionVoid, so a range check alone would accept a state that
+// no longer means anything - and a stored row carrying it would be read as
+// valid rather than flagged.
+func (s CommissionState) Valid() bool {
+	return s != commissionRetired && s <= CommissionVoid
+}
 
 // String returns the state name.
 func (s CommissionState) String() string {
@@ -195,8 +213,6 @@ func (s CommissionState) String() string {
 		return "pending"
 	case CommissionSettled:
 		return "settled"
-	case CommissionWithdrawn:
-		return "withdrawn"
 	case CommissionReversed:
 		return "reversed"
 	case CommissionFrozen:
@@ -211,7 +227,7 @@ func (s CommissionState) String() string {
 // Terminal reports whether the state is final (no further transitions).
 func (s CommissionState) Terminal() bool {
 	switch s {
-	case CommissionWithdrawn, CommissionReversed, CommissionVoid:
+	case CommissionReversed, CommissionVoid:
 		return true
 	default:
 		return false

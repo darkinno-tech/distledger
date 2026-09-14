@@ -207,14 +207,18 @@ func TestTransitionGuards(t *testing.T) {
 				})
 			}
 
-			// Pending -> Withdrawn skips a step and must be refused as illegal.
-			if err := transition(distledger.CommissionPending, distledger.CommissionWithdrawn, c.Version); !errors.Is(err, distledger.ErrIllegalTransition) {
+			// A self-transition is an edge the table does not have, so it must
+			// be refused as illegal. Both states are valid and the current state
+			// matches, which is what makes this the case that distinguishes an
+			// absent edge from a stale view and from a bad argument.
+			if err := transition(distledger.CommissionPending, distledger.CommissionPending, c.Version); !errors.Is(err, distledger.ErrIllegalTransition) {
 				t.Fatalf("illegal transition = %v, want ErrIllegalTransition", err)
 			}
 			// Claiming the wrong current state is a conflict, not an illegal
 			// transition: the two must stay distinguishable because only one of
-			// them is retryable.
-			if err := transition(distledger.CommissionSettled, distledger.CommissionWithdrawn, c.Version); !errors.Is(err, distledger.ErrConflict) {
+			// them is retryable. Settled -> Reversed is a legal edge, so the only
+			// thing wrong here is the caller's view of the current state.
+			if err := transition(distledger.CommissionSettled, distledger.CommissionReversed, c.Version); !errors.Is(err, distledger.ErrConflict) {
 				t.Fatalf("wrong current state = %v, want ErrConflict", err)
 			}
 			// The legal one succeeds.

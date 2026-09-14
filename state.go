@@ -23,9 +23,15 @@ var commissionTransitions = map[CommissionState][]CommissionState{
 		CommissionFrozen,
 		CommissionVoid,
 	},
-	// Settled: can be withdrawn or reversed by a refund.
+	// Settled: can be reversed by a refund.
+	//
+	// There is no transition to a "withdrawn" state. A withdrawal is an amount
+	// against the account's withdrawable balance, which is fungible across
+	// commissions, so marking particular commissions as paid out would be an
+	// arbitrary attribution that no invariant needs. What was paid out is
+	// recorded by the account's withdrawn bucket and by the withdrawal ledger
+	// entries, and reconciled by I4. See ADR-044.
 	CommissionSettled: {
-		CommissionWithdrawn,
 		CommissionReversed,
 	},
 	// Frozen by risk control: a successful appeal returns it to pending, a
@@ -42,13 +48,10 @@ var commissionTransitions = map[CommissionState][]CommissionState{
 	},
 	// The following are final states and never transition.
 	//
-	// CommissionWithdrawn is final because the money has already left the
-	// account; clawing it back is a money movement (through the Reverse policy
-	// and the negative-balance policy), not a state transition (delivered in
-	// v0.3).
-	CommissionWithdrawn: nil,
-	CommissionReversed:  nil,
-	CommissionVoid:      nil,
+	// A commission that has funded a payout is not among them, because there is
+	// no such state: see the note on CommissionSettled.
+	CommissionReversed: nil,
+	CommissionVoid:     nil,
 }
 
 // allCommissionStates lists every state in declaration order, for exhaustive
@@ -56,7 +59,6 @@ var commissionTransitions = map[CommissionState][]CommissionState{
 var allCommissionStates = []CommissionState{
 	CommissionPending,
 	CommissionSettled,
-	CommissionWithdrawn,
 	CommissionReversed,
 	CommissionFrozen,
 	CommissionVoid,

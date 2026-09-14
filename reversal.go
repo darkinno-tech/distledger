@@ -364,14 +364,10 @@ func (l *Ledger) reversalDelta(original Commission, cumulative, base Money, term
 	layer := original.Layer
 	agentID := original.AgentUserID
 
-	if original.State == CommissionWithdrawn {
-		// The money has already left the platform. Clawing it back needs a debt
-		// policy, which arrives together with withdrawals in v0.5.
-		return 0, 0, &SkipReason{
-			Layer: layer, AgentUserID: agentID, Code: SkipAlreadyWithdrawn,
-			Detail: "commission was already paid out",
-		}
-	}
+	// There is deliberately no branch here for "the commission was already paid
+	// out". A withdrawal does not mark commissions, and skipping the clawback
+	// for one would silently drop the platform's claim - the refund happened,
+	// and the debt policy is what decides how to answer that (ADR-042).
 	if original.State == CommissionReversed || original.State == CommissionVoid {
 		return 0, 0, &SkipReason{
 			Layer: layer, AgentUserID: agentID, Code: SkipFullyReversed,
