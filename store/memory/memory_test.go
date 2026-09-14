@@ -13,7 +13,7 @@ import (
 // This file holds **internal** tests for the in-memory Store: it inspects
 // derived indexes such as pendingDue directly.
 //
-// Why the index itself has to be checked instead of only the behaviour: the
+// Why the index itself has to be checked instead of only the behavior: the
 // read path performs a freshness check and silently skips stale index
 // entries. That protects correctness, but it also means index misalignment
 // never shows up as a wrong result — only as something that keeps getting

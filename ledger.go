@@ -106,7 +106,7 @@ func (l *Ledger) Now() time.Time { return l.clock.Now() }
 
 // ── Relation chain ───────────────────────────────────────────────────
 
-// BindAgent registers or updates a agent.
+// BindAgent registers or updates an agent.
 //
 // # The parent cannot change quietly
 //

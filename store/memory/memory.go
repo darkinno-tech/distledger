@@ -6,7 +6,7 @@
 //
 // # Consistency model
 //
-//   - Update holds a global write lock, so transactions are fully serialised.
+//   - Update holds a global write lock, so transactions are fully serialized.
 //     The effective isolation level is serialisable.
 //   - View holds a read lock and never sees uncommitted writes, because the
 //     read and write locks are mutually exclusive.

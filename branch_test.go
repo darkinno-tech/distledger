@@ -8,7 +8,7 @@ import (
 )
 
 // This file covers defensive branches and public entry points that the
-// behaviour-driven tests reach only indirectly. They are grouped here rather
+// behavior-driven tests reach only indirectly. They are grouped here rather
 // than scattered because their purpose is the same: pin down what happens on
 // the paths that should never run in production.
 //

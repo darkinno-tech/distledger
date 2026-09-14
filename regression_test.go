@@ -14,7 +14,7 @@ import (
 )
 
 // This file holds regression tests for defects found during an adversarial
-// review of v0.1. Each test names the behaviour it pins down, because the value
+// review of v0.1. Each test names the behavior it pins down, because the value
 // of these tests is entirely in preventing a recurrence.
 
 // TestItemCountIsBounded pins the work bound on accrual.
@@ -75,7 +75,7 @@ func TestReplayWithDifferentBuyerIsRejected(t *testing.T) {
 }
 
 // TestSelfPurchaseIsNotEligible pins a default that invariant I1 can never
-// catch: the books balance perfectly while a agent pays themselves a
+// catch: the books balance perfectly while an agent pays themselves a
 // commission on their own order.
 func TestSelfPurchaseIsNotEligible(t *testing.T) {
 	f := newFixture(t, distledger.Rules{Levels: 1, RateBP: []distledger.Rate{1000}})

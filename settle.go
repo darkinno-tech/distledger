@@ -37,7 +37,7 @@ const (
 // settlement date the agent has already been promised (see ADR-005).
 //
 // This event is idempotent and first-wins: a repeated delivery cannot move the
-// settlement date, which is what stops a agent from replaying a receipt
+// settlement date, which is what stops an agent from replaying a receipt
 // to unlock their commission early.
 //
 // ReceivedAt is taken on trust because only the order system knows when the

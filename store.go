@@ -219,7 +219,7 @@ type Writer interface {
 	// AppendRefund appends a refund voucher and returns the persisted record.
 	//
 	// An idempotency key conflict returns ErrDuplicate: that is precisely how
-	// "the same refund delivered twice" is recognised, and a caller should
+	// "the same refund delivered twice" is recognized, and a caller should
 	// treat it as "already refunded" rather than as a failure.
 	AppendRefund(ctx context.Context, r Refund) (Refund, error)
 

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// This file covers pure functions and type behaviour: enum string
+// This file covers pure functions and type behavior: enum string
 // representations, validation branches, Error/Unwrap on the error types, and
 // every failure face of rules validation.
 //
@@ -495,7 +495,7 @@ func TestManualClock(t *testing.T) {
 	c := NewManualClock(start)
 
 	if c.Now().Location() != time.UTC {
-		t.Fatalf("ManualClock must normalise to UTC, got %s", c.Now().Location())
+		t.Fatalf("ManualClock must normalize to UTC, got %s", c.Now().Location())
 	}
 	if !c.Now().Equal(start.UTC()) {
 		t.Fatalf("ManualClock lost the instant: %s vs %s", c.Now(), start.UTC())

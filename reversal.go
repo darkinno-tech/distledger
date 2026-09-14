@@ -388,7 +388,7 @@ func (l *Ledger) reversalDelta(original Commission, cumulative, base Money, term
 	// zero and nothing is written.
 	//
 	// Truncation is deliberate: rounding up would claw back more than the
-	// refund justifies, and a agent noticing an over-claw is a support
+	// refund justifies, and an agent noticing an over-claw is a support
 	// ticket, while the platform losing a fraction of a cent is not.
 	var want Money
 	if terminal == CommissionVoid {

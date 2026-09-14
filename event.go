@@ -250,7 +250,7 @@ type AccrueResult struct {
 	// Commissions are the commissions **newly created** by this call. Empty on
 	// a duplicate delivery.
 	Commissions []Commission
-	// Replayed reports whether this call was recognised as a replay of an
+	// Replayed reports whether this call was recognized as a replay of an
 	// earlier accrual, in which case Commissions is empty.
 	Replayed bool
 	// UnallocatedBase is the part of the paid amount that no order item claimed.
@@ -446,7 +446,7 @@ type BindAgentRequest struct {
 	// RateOverrideBP is optional and overrides the global rate.
 	RateOverrideBP *Rate
 	// Idempotent true means registering the same (UserID, ParentID) twice does
-	// not error. The default false behaviour is also idempotent; this field is
+	// not error. The default false behavior is also idempotent; this field is
 	// reserved for a future strict mode.
 	Idempotent bool
 }

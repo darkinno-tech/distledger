@@ -10,7 +10,7 @@ import (
 )
 
 // This file covers defensive branches on the refund and risk-control paths that
-// the behaviour-driven tests reach only indirectly. An uncovered guard is
+// the behavior-driven tests reach only indirectly. An uncovered guard is
 // indistinguishable from a guard that does not work, so each is exercised at
 // least once.
 
@@ -190,7 +190,7 @@ func TestVoidOnAlreadyReversedCommissionIsANoOp(t *testing.T) {
 // With no withdrawals yet, the money for a settled commission is always still in
 // the bucket, so this path is unreachable through the public API. It exists for
 // the day a commission can be paid out before its order is refunded - and the
-// behaviour that matters is that it fails loudly instead of pushing the bucket
+// behavior that matters is that it fails loudly instead of pushing the bucket
 // negative, which would silently invalidate invariant I1.
 func TestClawbackFailsLoudlyWhenTheBucketIsShort(t *testing.T) {
 	f := newFixture(t, distledger.Rules{

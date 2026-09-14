@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// JoinType describes how an agent joined the programme.
+// JoinType describes how an agent joined the program.
 //
 // Note: JoinPaid (paid enrolment) is only a **status marker** and takes no part
 // in any payout computation. The library deliberately offers no path of the
@@ -74,7 +74,7 @@ func (s AgentStatus) String() string {
 // Agent is one agent.
 //
 // The relation chain is expressed as a parent pointer plus a depth. A
-// materialised path was deliberately left out of v0.1: the depth is hard-capped
+// materialized path was deliberately left out of v0.1: the depth is hard-capped
 // at 3, so walking upwards takes at most 3 steps and a path would add
 // complexity with no measurable payoff; it can be introduced when "query the
 // whole team" becomes a requirement (see ADR-006).
@@ -363,7 +363,7 @@ type Account struct {
 // buckets walks that definition. Before this existed each check enumerated the
 // four fields by hand, which meant a newly added money field silently fell
 // outside every invariant: the ledger still balanced, the self check still
-// passed, and the only wrong thing was the number shown to the distributor.
+// passed, and the only wrong thing was the number shown to the agent.
 //
 // Adding a bucket therefore means adding a case here, and the reflection test in
 // model_test.go fails until the new Account field is classified as either a

@@ -169,7 +169,7 @@ func TestAccrueIsIdempotent(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		again := f.mustPay("ORD-1", 4001, 100000)
 		if !again.Replayed {
-			t.Fatalf("call %d was not recognised as a replay", i+2)
+			t.Fatalf("call %d was not recognized as a replay", i+2)
 		}
 		if len(again.Commissions) != 0 {
 			t.Fatalf("call %d produced %d new commissions", i+2, len(again.Commissions))

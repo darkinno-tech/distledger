@@ -193,7 +193,7 @@ func (t *tx) SetCommissionAvailableAt(ctx context.Context, id int64, at time.Tim
 	// First write wins: once the settlement date is fixed it never changes.
 	//
 	// The rule defends against replaying a receipt event to pull the settlement
-	// date forward. Without it, a agent could unlock their commission
+	// date forward. Without it, an agent could unlock their commission
 	// simply by re-triggering the callback.
 	if !c.AvailableAt.IsZero() {
 		return c, nil

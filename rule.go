@@ -230,7 +230,7 @@ type EligibilityInput struct {
 	// BuyerUserID is the buyer of the order.
 	//
 	// It is part of the input because self-purchase is the single most common
-	// abuse of a distribution programme: a agent buys through their own
+	// abuse of a distribution program: an agent buys through their own
 	// link and pays themselves a commission. An eligibility hook that cannot
 	// see the buyer cannot express that rule at all.
 	BuyerUserID int64
