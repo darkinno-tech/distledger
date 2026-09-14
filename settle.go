@@ -20,12 +20,17 @@ import (
 const (
 	// maintainBatch is the number of commissions handled per transaction.
 	maintainBatch = 200
-	// maxMaintainRounds bounds how many batches one Maintain call processes.
-	//
-	// The bound is deliberate: Maintain is normally driven by a per-minute cron
-	// job, so a large backlog should be worked through over several ticks
-	// rather than holding the job past its timeout.
+	// maintainTenantBatch is how many tenants are discovered per round.
+	maintainTenantBatch = 500
+	// maxMaintainRounds bounds how many rounds one Maintain call runs.
 	maxMaintainRounds = 100
+	// maxSettlePerMaintain is the work budget of a single Maintain call.
+	//
+	// Maintain is driven by a per-minute cron job, so a backlog should be worked
+	// through over several ticks rather than holding the job past its timeout.
+	// The budget makes the upper bound on one call explicit and independent of
+	// how many tenants happen to have work.
+	maxSettlePerMaintain = 20000
 )
 
 // OnOrderReceived handles "the buyer confirmed receipt".
@@ -126,24 +131,63 @@ func (l *Ledger) Maintain(ctx context.Context) (MaintainResult, error) {
 	var (
 		total  MaintainResult
 		failed []error
+		// A quarantined commission stays in the settlement index, because
+		// nothing about it changed, so a later round finds it again. Dedup spans
+		// the whole call, not one tenant's batches, or the report would repeat
+		// the same record once per round.
+		seenQuarantine = make(map[int64]struct{})
 	)
-	tenants, err := l.tenants(ctx)
-	if err != nil {
-		return total, err
-	}
-	for _, tenantID := range tenants {
-		part, err := l.maintainTenant(ctx, tenantID, now)
-		total.Quarantined = append(total.Quarantined, part.Quarantined...)
-		total.SettledCount += part.SettledCount
-		if amount, addErr := total.SettledAmount.Add(part.SettledAmount); addErr != nil {
-			return total, addErr
-		} else {
-			total.SettledAmount = amount
+	for round := 0; round < maxMaintainRounds; round++ {
+		if total.SettledCount >= maxSettlePerMaintain {
+			break
 		}
+
+		tenants, err := l.tenantsWithDueWork(ctx, now)
 		if err != nil {
-			failed = append(failed, fmt.Errorf("tenant %d: %w", tenantID, err))
+			return total, err
+		}
+		if len(tenants) == 0 {
+			// Nothing is due anywhere. This is the common case, and it now costs
+			// one index query rather than one transaction per tenant.
+			break
+		}
+
+		progressed := false
+		for _, tenantID := range tenants {
+			part, err := l.maintainTenant(ctx, tenantID, now)
+			for _, id := range part.Quarantined {
+				if _, dup := seenQuarantine[id]; dup {
+					continue
+				}
+				seenQuarantine[id] = struct{}{}
+				total.Quarantined = append(total.Quarantined, id)
+				l.log.WarnContext(ctx, "commission quarantined during settlement",
+					"tenant_id", tenantID, "commission_id", id)
+			}
+			total.SettledCount += part.SettledCount
+			amount, addErr := total.SettledAmount.Add(part.SettledAmount)
+			if addErr != nil {
+				return total, addErr
+			}
+			total.SettledAmount = amount
+			if part.SettledCount > 0 {
+				progressed = true
+			}
+			if err != nil {
+				// A failing tenant must not stop the others, so the error is
+				// collected and the loop continues.
+				failed = append(failed, fmt.Errorf("tenant %d: %w", tenantID, err))
+			}
+		}
+
+		// No progress across every tenant that had work means every remaining
+		// candidate is stuck (conflicts or quarantined records). Looping again
+		// would spin.
+		if !progressed {
+			break
 		}
 	}
+
 	if len(failed) > 0 {
 		return total, errors.Join(failed...)
 	}
@@ -156,24 +200,18 @@ func (l *Ledger) Maintain(ctx context.Context) (MaintainResult, error) {
 	return total, nil
 }
 
-func (l *Ledger) tenants(ctx context.Context) ([]int64, error) {
+func (l *Ledger) tenantsWithDueWork(ctx context.Context, now time.Time) ([]int64, error) {
 	var out []int64
 	err := l.store.View(ctx, func(ctx context.Context, r Reader) error {
 		var err error
-		out, err = r.Tenants(ctx)
+		out, err = r.TenantsWithDueWork(ctx, now, maintainTenantBatch)
 		return err
 	})
 	return out, err
 }
 
 func (l *Ledger) maintainTenant(ctx context.Context, tenantID int64, now time.Time) (MaintainResult, error) {
-	var (
-		out MaintainResult
-		// A quarantined commission stays in the settlement index (nothing
-		// changed about it), so the next round would find it again. The set
-		// keeps the report honest without silently dropping it from the index.
-		seenQuarantine = make(map[int64]struct{})
-	)
+	var out MaintainResult
 	for round := 0; round < maxMaintainRounds; round++ {
 		// Each batch is its own transaction: batches do not share a lock, and
 		// the impact of one failure stays bounded.
@@ -232,15 +270,7 @@ func (l *Ledger) maintainTenant(ctx context.Context, tenantID int64, now time.Ti
 		} else {
 			out.SettledAmount = amount
 		}
-		for _, id := range roundQuarantine {
-			if _, dup := seenQuarantine[id]; dup {
-				continue
-			}
-			seenQuarantine[id] = struct{}{}
-			out.Quarantined = append(out.Quarantined, id)
-			l.log.WarnContext(ctx, "commission quarantined during settlement",
-				"tenant_id", tenantID, "commission_id", id)
-		}
+		out.Quarantined = append(out.Quarantined, roundQuarantine...)
 
 		// No progress means either nothing is due or every candidate hit a
 		// conflict. Both mean stop, otherwise this becomes a spin loop.

@@ -243,16 +243,48 @@ func (r *reader) CountCommissionsByState(ctx context.Context, tenantID int64) (m
 	return out, nil
 }
 
-// Tenants reads the tenant registry directly.
+// TenantsWithDueWork reads the settlement index.
 //
-// It used to derive the list by scanning four maps on every call, which made
-// Maintain proportional to the entire data set on a per-minute timer.
-func (r *reader) Tenants(ctx context.Context) ([]int64, error) {
+// The index is sorted by (tenant, due time, id), so one tenant's entries are
+// contiguous and its earliest entry is its first. That means each candidate
+// tenant costs a bounded look rather than a scan: walk the index, and for each
+// tenant block decide from its head whether it has work, then jump to the next
+// tenant with a binary search.
+func (r *reader) TenantsWithDueWork(ctx context.Context, dueAt time.Time, limit int) ([]int64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	out := make([]int64, len(r.d.tenants))
-	copy(out, r.d.tenants)
+	if limit <= 0 {
+		limit = distledger.DefaultPageLimit
+	}
+	idx := r.d.pendingDue
+	out := make([]int64, 0, minInt(limit, len(idx)))
+
+	for i := 0; i < len(idx) && len(out) < limit; {
+		tenantID := idx[i].tenantID
+		blockEnd := i + sort.Search(len(idx)-i, func(j int) bool {
+			return idx[i+j].tenantID != tenantID
+		})
+
+		// Within the block the entries ascend by due time, so the first fresh
+		// entry that has arrived settles the question for this tenant.
+		for j := i; j < blockEnd; j++ {
+			if idx[j].at.After(dueAt) {
+				break
+			}
+			c, ok := r.d.commissions[idx[j].id]
+			if !ok {
+				continue
+			}
+			// Same freshness rule as DueCommissions: a stale index entry is
+			// skipped rather than trusted.
+			if c.State == distledger.CommissionPending && c.AvailableAt.Equal(idx[j].at) {
+				out = append(out, tenantID)
+				break
+			}
+		}
+		i = blockEnd
+	}
 	return out, nil
 }
 

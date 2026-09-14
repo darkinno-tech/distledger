@@ -42,7 +42,6 @@ type TableDef struct {
 }
 
 const (
-	tableTenant     = "dist_tenant"
 	tableAgent      = "dist_agent"
 	tableBinding    = "dist_binding"
 	tableAccount    = "dist_account"
@@ -88,17 +87,6 @@ func cloneCols(in [][]string) [][]string {
 }
 
 var schemaTables = []TableDef{
-	{
-		// The tenant registry exists so that Reader.Tenants is one indexed lookup
-		// instead of a DISTINCT over several large tables, which Maintain would
-		// otherwise run on every tick (ADR-034).
-		Name: tableTenant,
-		Columns: []ColumnDef{
-			{Name: "tenant_id", Kind: KindInt64, NotNull: true},
-			{Name: "created_at", Kind: KindInstant},
-		},
-		Primary: []string{"tenant_id"},
-	},
 	{
 		Name: tableAgent,
 		Columns: []ColumnDef{
@@ -181,10 +169,15 @@ var schemaTables = []TableDef{
 		Primary: []string{"id"},
 		Uniques: [][]string{{"tenant_id", "idem_key"}},
 		Indexes: [][]string{
-			{"tenant_id", "id"},                          // CommissionsByTenant keyset
-			{"tenant_id", "order_id"},                    // CommissionsByOrder
-			{"tenant_id", "agent_user_id", "id"},         // CommissionsByAgent keyset
-			{"tenant_id", "state", "available_at", "id"}, // DueCommissions
+			{"tenant_id", "id"},                  // CommissionsByTenant keyset
+			{"tenant_id", "order_id"},            // CommissionsByOrder
+			{"tenant_id", "agent_user_id", "id"}, // CommissionsByAgent keyset
+			// DueCommissions and TenantsWithDueWork scan this across every
+			// tenant, so state and time lead and the tenant trails. A
+			// tenant-first index would make the heartbeat scan the whole backlog
+			// of whichever tenant sorts first, which is how a noisy neighbour
+			// stalls everyone else's settlement.
+			{"state", "available_at", "tenant_id"},
 		},
 	},
 	{

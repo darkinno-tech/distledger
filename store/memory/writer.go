@@ -23,25 +23,6 @@ type tx struct {
 
 var _ distledger.Tx = (*tx)(nil)
 
-// touchTenant registers a tenant the first time anything is written for it.
-//
-// Every write path calls this, so the registry stays complete without anyone
-// having to remember to maintain it separately.
-func touchTenant(d *data, u *undo, tenantID int64) {
-	idx := d.tenants
-	pos := sort.Search(len(idx), func(i int) bool { return idx[i] >= tenantID })
-	if pos < len(idx) && idx[pos] == tenantID {
-		return
-	}
-	if pos == len(idx) {
-		u.tenants.noteAppend(idx)
-		d.tenants = append(idx, tenantID)
-		return
-	}
-	u.tenants.noteStructural(idx)
-	d.tenants = slices.Insert(idx, pos, tenantID)
-}
-
 func (t *tx) PutAgent(ctx context.Context, a distledger.Agent) (distledger.Agent, error) {
 	if err := ctx.Err(); err != nil {
 		return a, err
@@ -69,7 +50,6 @@ func (t *tx) PutAgent(ctx context.Context, a distledger.Agent) (distledger.Agent
 	}
 
 	saveAgent(t.u, d, a.Key)
-	touchTenant(d, t.u, a.Key.TenantID)
 	a.Version++
 	d.agents[a.Key] = a
 	return a, nil
@@ -96,7 +76,6 @@ func (t *tx) PutBinding(ctx context.Context, b distledger.Binding) (distledger.B
 	}
 
 	saveBinding(t.u, d, b.Buyer)
-	touchTenant(d, t.u, b.Buyer.TenantID)
 	b.Version++
 	d.bindings[b.Buyer] = b
 	return b, nil
@@ -124,7 +103,6 @@ func (t *tx) PutAccount(ctx context.Context, a distledger.Account) (distledger.A
 	}
 
 	saveAccount(t.u, d, a.Key)
-	touchTenant(d, t.u, a.Key.TenantID)
 	if !existed {
 		insertAccountID(d, t.u, a.Key)
 	}
@@ -186,7 +164,6 @@ func (t *tx) AppendCommission(ctx context.Context, c distledger.Commission) (dis
 
 	saveIdem(t.u, d, ref)
 	d.idem[ref] = c.ID
-	touchTenant(d, t.u, c.Key.TenantID)
 	saveCommission(t.u, d, c.ID)
 	d.commissions[c.ID] = c
 	d.commissionIDs = append(d.commissionIDs, c.ID)
@@ -347,7 +324,6 @@ func (t *tx) AppendRefund(ctx context.Context, r distledger.Refund) (distledger.
 
 	saveRefundIdem(t.u, d, ref)
 	d.refundIdem[ref] = r.ID
-	touchTenant(d, t.u, r.Key.TenantID)
 	saveRefund(t.u, d, r.ID)
 	d.refunds[r.ID] = r
 
@@ -377,7 +353,6 @@ func (t *tx) AppendLedger(ctx context.Context, e distledger.LedgerEntry) (distle
 
 	saveLedger(t.u, d, e.ID)
 	d.ledger[e.ID] = e
-	touchTenant(d, t.u, e.Key.TenantID)
 	d.ledgerIDs = append(d.ledgerIDs, e.ID)
 
 	noteAppendIndex(t.u.ledgerByUser, d.ledgerByUser, e.Key)

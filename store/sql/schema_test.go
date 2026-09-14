@@ -67,7 +67,6 @@ func TestSchemaCoversEveryDomainField(t *testing.T) {
 		"dist_commission": {"id", "tenant_id", "order_id", "order_item_id", "idem_key", "buyer_user_id", "agent_user_id", "layer", "base_amount", "rate_bp", "amount", "reversed_amount", "state", "freeze_days", "available_at", "settled_at", "accrued_at", "rule_version", "rule_snapshot", "reverse_of", "version"},
 		"dist_ledger":     {"id", "tenant_id", "user_id", "biz_type", "biz_id", "delta_frozen", "delta_available", "delta_withdrawing", "delta_withdrawn", "after_frozen", "after_available", "after_withdrawing", "after_withdrawn", "remark", "created_at"},
 		"dist_refund":     {"id", "tenant_id", "order_id", "item_id", "idem_key", "amount", "cumulative", "refunded_at"},
-		"dist_tenant":     {"tenant_id"},
 	}
 
 	got := make(map[string]map[string]bool, len(sqlstore.Schema()))
@@ -93,19 +92,31 @@ func TestSchemaCoversEveryDomainField(t *testing.T) {
 	}
 }
 
-// TestSchemaHasTheTenantRegistry pins the decision that made Reader.Tenants
-// cheap on every backend (ADR-034). Without this table the tenant list would have
-// to be a DISTINCT over the largest tables, executed once per heartbeat.
-func TestSchemaHasTheTenantRegistry(t *testing.T) {
+// TestDueWorkIndexLeadsWithStateAndTime pins the index shape that makes the
+// heartbeat cheap (ADR-035).
+//
+// TenantsWithDueWork asks "which tenants have work" across the whole
+// installation, and DueCommissions asks the same question for one tenant. Both
+// are answered by a range scan over this index. Ordering it tenant-first instead
+// would make the cross-tenant query scan the entire backlog of whichever tenant
+// happens to sort first, so the column order is load-bearing and is asserted here.
+func TestDueWorkIndexLeadsWithStateAndTime(t *testing.T) {
 	for _, table := range sqlstore.Schema() {
-		if table.Name == "dist_tenant" {
-			if len(table.Primary) != 1 || table.Primary[0] != "tenant_id" {
-				t.Fatalf("dist_tenant primary key = %v, want [tenant_id]", table.Primary)
-			}
-			return
+		if table.Name != "dist_commission" {
+			continue
 		}
+		for _, idx := range table.Indexes {
+			if len(idx) == 3 && idx[0] == "state" {
+				if idx[1] != "available_at" || idx[2] != "tenant_id" {
+					t.Fatalf("due-work index = %v, want [state available_at tenant_id]", idx)
+				}
+				return
+			}
+		}
+		t.Fatal("dist_commission has no (state, available_at, tenant_id) index; " +
+			"the heartbeat would fall back to scanning")
 	}
-	t.Fatal("dist_tenant is missing; Reader.Tenants would have to scan the data set")
+	t.Fatal("dist_commission is missing from the schema")
 }
 
 // TestPrimaryKeysAreNotDuplicated checks the interaction between a dialect's

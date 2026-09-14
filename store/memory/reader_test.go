@@ -198,31 +198,6 @@ func TestAppendLedgerValidation(t *testing.T) {
 	}
 }
 
-func TestTenantsAreDeduplicatedAndSorted(t *testing.T) {
-	s := newStore(t)
-	// Both multiple users under the same tenant and multiple tenants must be
-	// deduplicated and sorted.
-	for i, tn := range []int64{3, 1, 2, 1, 3} {
-		seedAgentIn(t, s, tn, int64(100+i))
-	}
-	withRead(t, s, func(ctx context.Context, r distledger.Reader) error {
-		tenants, err := r.Tenants(ctx)
-		if err != nil {
-			return err
-		}
-		want := []int64{1, 2, 3}
-		if len(tenants) != len(want) {
-			t.Fatalf("Tenants = %v, want %v", tenants, want)
-		}
-		for i := range want {
-			if tenants[i] != want[i] {
-				t.Fatalf("Tenants = %v, want %v", tenants, want)
-			}
-		}
-		return nil
-	})
-}
-
 func TestCommissionsByTenantFiltersAndPaginates(t *testing.T) {
 	s := newStore(t)
 	for i := 1; i <= 5; i++ {
@@ -791,8 +766,8 @@ func TestReaderMethodsHonourCancellation(t *testing.T) {
 			_, err := r.CountCommissionsByState(ctx, 1)
 			return err
 		},
-		"Tenants": func(ctx context.Context, r distledger.Reader) error {
-			_, err := r.Tenants(ctx)
+		"TenantsWithDueWork": func(ctx context.Context, r distledger.Reader) error {
+			_, err := r.TenantsWithDueWork(ctx, time.Now().Add(time.Hour), 10)
 			return err
 		},
 	}
@@ -938,145 +913,132 @@ func TestMultipleDueAppendsInOneTransaction(t *testing.T) {
 	}
 }
 
-// TestTenantsComeFromTheRegistryNotAScan pins the contract on Reader.Tenants.
-//
-// Maintain asks for the tenant list on every tick, so the answer must not be
-// derived by walking the data set. The registry is checked directly here, which
-// is the only way to tell the two implementations apart: both return the same
-// list, and only one of them stays cheap as the installation grows.
-func TestTenantsComeFromTheRegistryNotAScan(t *testing.T) {
+// TestTenantsWithDueWorkReadsTheIndex pins the contract on
+// Reader.TenantsWithDueWork, which replaced an earlier "list every tenant"
+// method. The earlier shape made Maintain open one transaction per tenant per
+// tick; this shape makes it proportional to the tenants that actually have work
+// (ADR-035).
+func TestTenantsWithDueWorkReadsTheIndex(t *testing.T) {
 	s := newStore(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	if len(s.d.tenants) != 0 {
-		t.Fatalf("a fresh store already has %d registered tenants", len(s.d.tenants))
+	// Three tenants get a settlement date; one commission never does.
+	withDue := func(tenantID int64, orderID string, dueIn time.Duration) {
+		t.Helper()
+		c := seedCommissionIn(t, s, tenantID, orderID, 100, distledger.CommissionPending)
+		withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
+			cur, err := tx.Commission(ctx, c.ID)
+			if err != nil {
+				return err
+			}
+			_, err = tx.SetCommissionAvailableAt(ctx, c.ID, base.Add(dueIn), cur.Version)
+			return err
+		})
 	}
+	withDue(1, "ORD-A", -2*time.Hour)                                     // due two hours ago
+	withDue(5, "ORD-B", -time.Hour)                                       // due one hour ago
+	withDue(9, "ORD-C", 48*time.Hour)                                     // not due yet
+	seedCommissionIn(t, s, 7, "ORD-D", 100, distledger.CommissionPending) // never received
 
-	// Distinct users, repeated tenants: the registry must deduplicate and sort.
-	for i, tn := range []int64{5, 2, 9, 2, 5} {
-		seedAgentIn(t, s, tn, int64(100+i))
-	}
-
-	// The registry holds each tenant once, ascending, and is what Tenants reads.
-	want := []int64{2, 5, 9}
-	if !slices.Equal(s.d.tenants, want) {
-		t.Fatalf("registry = %v, want %v", s.d.tenants, want)
-	}
 	withRead(t, s, func(ctx context.Context, r distledger.Reader) error {
-		got, err := r.Tenants(ctx)
+		got, err := r.TenantsWithDueWork(ctx, base, 100)
 		if err != nil {
 			return err
 		}
+		want := []int64{1, 5}
 		if !slices.Equal(got, want) {
-			t.Fatalf("Tenants = %v, want %v", got, want)
+			t.Fatalf("TenantsWithDueWork = %v, want %v", got, want)
 		}
-		// The caller must not be able to mutate the registry through the copy.
-		got[0] = 999
+
+		// The limit bounds the answer and the order stays ascending, so a caller
+		// can resume deterministically.
+		limited, err := r.TenantsWithDueWork(ctx, base, 1)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(limited, []int64{1}) {
+			t.Fatalf("limited = %v, want [1]", limited)
+		}
+
+		// Nothing due anywhere is the common case and must cost nothing.
+		none, err := r.TenantsWithDueWork(ctx, base.Add(-100*time.Hour), 100)
+		if err != nil {
+			return err
+		}
+		if len(none) != 0 {
+			t.Fatalf("expected no tenants with work, got %v", none)
+		}
 		return nil
 	})
-	if s.d.tenants[0] != 2 {
-		t.Fatal("Tenants returned the registry's own backing array")
-	}
 }
 
-// TestTenantRegistryCoversEveryWritePath checks that a tenant is registered by
-// whichever kind of row happens to be written first, not only by PutAgent.
-func TestTenantRegistryCoversEveryWritePath(t *testing.T) {
-	cases := map[string]func(t *testing.T, s *Store, tenantID int64){
-		"account": func(t *testing.T, s *Store, tenantID int64) {
-			withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
-				_, err := tx.PutAccount(ctx, distledger.Account{
-					Key: distledger.UserKey{TenantID: tenantID, UserID: 1},
-				})
-				return err
-			})
-		},
-		"binding": func(t *testing.T, s *Store, tenantID int64) {
-			withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
-				_, err := tx.PutBinding(ctx, distledger.Binding{
-					Buyer:       distledger.UserKey{TenantID: tenantID, UserID: 1},
-					AgentUserID: 2, Source: distledger.SourceLink, Active: true,
-				})
-				return err
-			})
-		},
-		"commission": func(t *testing.T, s *Store, tenantID int64) {
-			withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
-				_, err := tx.AppendCommission(ctx, distledger.Commission{
-					Key:     distledger.OrderKey{TenantID: tenantID, OrderID: "ORD-1"},
-					IdemKey: "k", AgentUserID: 1, Layer: 1,
-					BaseAmount: 100, Amount: 10, State: distledger.CommissionPending,
-				})
-				return err
-			})
-		},
-		"ledger": func(t *testing.T, s *Store, tenantID int64) {
-			withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
-				_, err := tx.AppendLedger(ctx, distledger.LedgerEntry{
-					Key:     distledger.UserKey{TenantID: tenantID, UserID: 1},
-					BizType: distledger.LedgerAccrue, BizID: "1", DeltaFrozen: 1,
-				})
-				return err
-			})
-		},
-		"refund": func(t *testing.T, s *Store, tenantID int64) {
-			withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
-				_, err := tx.AppendRefund(ctx, distledger.Refund{
-					Key:    distledger.OrderKey{TenantID: tenantID, OrderID: "ORD-1"},
-					ItemID: "", Amount: 100, Cumulative: 100, IdemKey: "r1",
-				})
-				return err
-			})
-		},
-	}
-
-	for name, write := range cases {
-		t.Run(name, func(t *testing.T) {
-			s := newStore(t)
-			write(t, s, 42)
-			if !slices.Equal(s.d.tenants, []int64{42}) {
-				t.Fatalf("registry = %v, want [42] after a %s write", s.d.tenants, name)
-			}
-		})
-	}
-}
-
-// TestTenantRegistryRollsBack keeps a failed transaction from leaving a tenant
-// behind that has no data, which would make Maintain open an empty transaction
-// for it forever.
-func TestTenantRegistryRollsBack(t *testing.T) {
+// TestTenantsWithDueWorkIgnoresStaleIndexEntries keeps the stale-entry rule
+// consistent with DueCommissions: an index entry that disagrees with the
+// commission it points at must not create work.
+func TestTenantsWithDueWorkIgnoresStaleIndexEntries(t *testing.T) {
 	s := newStore(t)
-	ctx := context.Background()
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	err := s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
-		if _, err := tx.PutAgent(ctx, distledger.Agent{
-			Key: distledger.UserKey{TenantID: 77, UserID: 1}, Status: distledger.AgentActive,
-		}); err != nil {
+	c := seedCommissionIn(t, s, 3, "ORD-1", 100, distledger.CommissionPending)
+	withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
+		_, err := tx.SetCommissionAvailableAt(ctx, c.ID, base, c.Version)
+		return err
+	})
+
+	// Make the index entry stale without removing it, the way a crashed writer
+	// would leave it.
+	s.mu.Lock()
+	stale := s.d.commissions[c.ID]
+	stale.State = distledger.CommissionSettled
+	s.d.commissions[c.ID] = stale
+	s.mu.Unlock()
+
+	withRead(t, s, func(ctx context.Context, r distledger.Reader) error {
+		got, err := r.TenantsWithDueWork(ctx, base.Add(time.Hour), 100)
+		if err != nil {
 			return err
 		}
-		return errors.New("boom")
+		if len(got) != 0 {
+			t.Fatalf("a stale index entry produced work for %v", got)
+		}
+		return nil
 	})
-	if err == nil {
-		t.Fatal("expected the transaction to fail")
-	}
-	if len(s.d.tenants) != 0 {
-		t.Fatalf("registry kept %v after a rolled-back transaction", s.d.tenants)
+}
+
+// TestTenantsWithDueWorkSeesEveryTenantInABlock covers the binary search that
+// skips from one tenant's entries to the next. A bug there would silently hide
+// every tenant after the first, which is the kind of failure that looks like
+// "settlement stopped for some tenants" months later.
+func TestTenantsWithDueWorkSeesEveryTenantInABlock(t *testing.T) {
+	s := newStore(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// Several commissions per tenant, some due and some not, so each tenant's
+	// block holds more than one entry and the skip has to be exact.
+	for _, tenantID := range []int64{1, 2, 3, 4, 5} {
+		for i, dueIn := range []time.Duration{-time.Hour, time.Hour, 48 * time.Hour} {
+			c := seedCommissionIn(t, s, tenantID,
+				fmt.Sprintf("ORD-%d-%d", tenantID, i), 100, distledger.CommissionPending)
+			withTx(t, s, func(ctx context.Context, tx distledger.Tx) error {
+				cur, err := tx.Commission(ctx, c.ID)
+				if err != nil {
+					return err
+				}
+				_, err = tx.SetCommissionAvailableAt(ctx, c.ID, base.Add(dueIn), cur.Version)
+				return err
+			})
+		}
 	}
 
-	// The append path is the common one, so exercise it too.
-	seedAgentIn(t, s, 1, 100)
-	seedAgentIn(t, s, 3, 100)
-	err = s.Update(ctx, func(ctx context.Context, tx distledger.Tx) error {
-		if _, err := tx.PutAgent(ctx, distledger.Agent{
-			Key: distledger.UserKey{TenantID: 2, UserID: 1}, Status: distledger.AgentActive,
-		}); err != nil {
+	withRead(t, s, func(ctx context.Context, r distledger.Reader) error {
+		got, err := r.TenantsWithDueWork(ctx, base, 100)
+		if err != nil {
 			return err
 		}
-		return errors.New("boom")
+		want := []int64{1, 2, 3, 4, 5}
+		if !slices.Equal(got, want) {
+			t.Fatalf("TenantsWithDueWork = %v, want %v", got, want)
+		}
+		return nil
 	})
-	if err == nil {
-		t.Fatal("expected the transaction to fail")
-	}
-	if !slices.Equal(s.d.tenants, []int64{1, 3}) {
-		t.Fatalf("registry = %v, want [1 3] (a middle insert must roll back cleanly)", s.d.tenants)
-	}
 }

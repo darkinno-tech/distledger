@@ -11,7 +11,8 @@ Every rule — how many levels, what rates, whether there is an entry bar — is
 
 **It is not a distribution system.** It is the part of one that is easiest to get wrong and should never be rewritten.
 
-> 📄 Full requirements and design: **[PRD.md](PRD.md)** (Chinese) ｜ Decisions and their costs: **[docs/design-decisions.md](docs/design-decisions.md)** (Chinese)
+> 📄 Full requirements and design: **[PRD.md](PRD.md)** ｜ Decisions and their costs: **[docs/design-decisions.md](docs/design-decisions.md)** ｜
+> Behavior at billion-row scale: **[docs/scale.md](docs/scale.md)** (all three are Chinese; they record design intent for the maintainer)
 > 中文说明见 **[README.zh-CN.md](README.zh-CN.md)**。
 
 ---
@@ -274,6 +275,11 @@ These are the entire reason the library exists, and the things `SelfCheck` shoul
 > The bucket set is defined in exactly one place (`Bucket`), and the negative-balance guard, I1 and ledger construction all walk it.
 > A reflection test forces every new `Money` field on `Account` to be classified as either a bucket or an explicitly exempt total with a named covering invariant,
 > so an invariant cannot quietly stop applying to a new field (ADR-029).
+
+**Cost is tested, not just correctness.** The heartbeat's operation count is asserted directly, because a
+per-tenant loop and a per-work loop settle exactly the same commissions — the difference only appears at scale,
+which is the worst place to discover it. With 500 idle tenants and nothing due, `Maintain` must perform
+exactly one read and zero transactions. See [docs/scale.md](docs/scale.md).
 
 **Testing strategy**: invariants first. Two randomized property tests — one over payment/receipt/settlement (40 seeds × 220 operations), one over refunds
 (25 seeds × 200 operations mixing instalment refunds, deliberate replays of the *same* refund id, and genuine repeat refunds with fresh ids).

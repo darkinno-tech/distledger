@@ -158,23 +158,28 @@ type Reader interface {
 	// CountCommissionsByState counts commissions by state.
 	CountCommissionsByState(ctx context.Context, tenantID int64) (map[CommissionState]int64, error)
 
-	// Tenants returns every tenant ID that has appeared in the library, in
-	// ascending order.
+	// TenantsWithDueWork returns the tenants holding at least one pending
+	// commission whose settlement time has arrived, in ascending order, at most
+	// limit of them.
 	//
-	// Maintain calls this on every tick, so an implementation MUST answer it
-	// without scanning the data set. Keep a registry of the tenants written to so
-	// far, updated when a tenant is first written to; do not compute the list by
-	// scanning agents, accounts and commissions and taking the union of their
-	// tenant IDs.
+	// # Why the port asks for work rather than for tenants
 	//
-	// A SQL backend makes the requirement concrete: the union form needs a
-	// DISTINCT over several large tables, while a registry table is one indexed
-	// lookup of a handful of rows.
+	// An earlier version of this port exposed "list every tenant", and Maintain
+	// walked that list opening a transaction per tenant. At a thousand tenants
+	// that is a thousand transactions per tick whether or not any work exists; at
+	// tens of thousands it is the dominant cost of the heartbeat.
 	//
-	// The library still keeps no tenant *entity*: tenants belong to the caller's
-	// domain model, and this library only treats them as a data partition key.
-	// The registry is an index, nothing more.
-	Tenants(ctx context.Context) ([]int64, error)
+	// The library does not own tenants - they belong to the caller's domain model
+	// - so it has no business enumerating them. What it does own is the work, and
+	// that is what it should ask for.
+	//
+	// # Cost
+	//
+	// An implementation MUST answer this from an index, not by scanning
+	// commissions. The natural shape is an index ordered by (state, available_at,
+	// tenant_id), which makes this an index-only range scan whose cost is
+	// proportional to the tenants that actually have work.
+	TenantsWithDueWork(ctx context.Context, dueAt time.Time, limit int) ([]int64, error)
 }
 
 // Writer is the write port.
